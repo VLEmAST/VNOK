@@ -217,8 +217,6 @@ def train_model():
                 f.write(name + '\n')
                 f.write(desc + '\n')
         
-        # Обучаем модель
-        model = fasttext.train_unsupervised(train_file_path, model='skipgram', dim=200, epoch=20, ws=5, minCount=5)
         
         # Сохраняем модель
         model.save_model(model_save_path)  # Используем путь по умолчанию
