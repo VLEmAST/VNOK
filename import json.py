@@ -21,19 +21,22 @@ from flet import (
     Colors,
     Dropdown,
     dropdown,
-    ProgressBar,  # Import ProgressBar
+    SnackBar,  # Import SnackBar
 )
 import threading
 import os
 import time  # Import time module
 import io  # Добавлен импорт io
 
-try:  #Попытка импортировать python-docx, если не установлен, то пользователю будет предложено установить
+try:  # Попытка импортировать python-docx, если не установлен, то пользователю будет предложено установить
     from docx import Document
     from docx.shared import Inches  # Import Inches for setting image size
 except ImportError:
-    print("Библиотека python-docx не установлена.  Установите ее с помощью pip install python-docx для сохранения в формате .doc")
-    Document = None #Устанавливаем в None, чтобы избежать ошибок при попытке сохранения в doc
+    print(
+        "Библиотека python-docx не установлена.  Установите ее с помощью pip install python-docx для сохранения в формате .doc"
+    )
+    Document = None  # Устанавливаем в None, чтобы избежать ошибок при попытке сохранения в doc
+
 
 # Инициализация
 morph = pymorphy3.MorphAnalyzer()
@@ -45,31 +48,50 @@ all_names = []
 all_ids = []
 model = None
 df = None
-punctuation_regex = re.compile(f'[{re.escape(string.punctuation)}]')
+punctuation_regex = re.compile(f"[{re.escape(string.punctuation)}]")
 loaded_files = []  # Список для хранения путей к загруженным файлам
 
 # Пути по умолчанию для сохранения модели и результатов
 model_save_path = "fasttext_model.bin"
-output_folder = "" # Папка для сохранения результатов (изначально пустая)
+output_folder = ""  # Папка для сохранения результатов (изначально пустая)
 
 # Глобальные переменные
 selected_file_index = 0  # Индекс файла для анализа
 reference_text = ""  # Текст "опорного" описания
-results_data = [] # Данные результатов
 selected_format = "Текстовый файл"  # Формат сохранения по умолчанию
+page = None  # Глобальная переменная для Page
+save_file_picker = None  # Объявляем save_file_picker как глобальную переменную
+general_output = None  # Объявляем general_output как глобальную переменную
+get_data_path = None
+get_stopwords_path = None
+file_dropdown_changed = None
+format_changed = None
+pick_files_data = None
+pick_files_stopwords = None
+show_results_clicked = None
+save_results_button_clicked = None
+save_model_button_clicked = None
+pick_files_model = None
+get_model_path = None
+train_model_threaded = None
+results_list = []  # Список для хранения результатов
+
 
 # Функция предобработки текста
 def preprocess_text(text, stop_words, morph, punctuation_regex):
-    text = re.sub(r'[\r\n]+', ' ', text)
-    text = punctuation_regex.sub('', text).lower()
+    text = re.sub(r"[\r\n]+", " ", text)
+    text = punctuation_regex.sub("", text).lower()
     words = text.split()
-    lemmatized_words = [morph.parse(word)[0].normal_form for word in words if word not in stop_words]
-    return ' '.join(lemmatized_words)
+    lemmatized_words = [
+        morph.parse(word)[0].normal_form for word in words if word not in stop_words
+    ]
+    return " ".join(lemmatized_words)
+
 
 # Функция загрузки данных из JSON файла
 def load_data(filepath):
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         if isinstance(data, dict):
@@ -79,7 +101,9 @@ def load_data(filepath):
         if isinstance(data, list):
             return data
         else:
-            print(f"Ошибка: Файл '{filepath}' имеет неправильную структуру. Ожидается список или объект.")
+            print(
+                f"Ошибка: Файл '{filepath}' имеет неправильную структуру. Ожидается список или объект."
+            )
             return None
 
     except FileNotFoundError:
@@ -91,6 +115,7 @@ def load_data(filepath):
     except Exception as e:
         print(f"Произошла ошибка при загрузке данных: {e}")
         return None
+
 
 def load_data_from_files(filepaths):
     global all_descriptions, all_names, all_ids, df, loaded_files
@@ -105,42 +130,68 @@ def load_data_from_files(filepaths):
         if data:
             if isinstance(data, list):
                 for item in data:
-                    if isinstance(item, dict) and "Description" in item and "Name" in item and "Id" in item:
-                        all_descriptions.append(item.get('Description', ''))
-                        all_names.append(item.get('Name', ''))
-                        all_ids.append(item.get('Id', None))
+                    if (
+                        isinstance(item, dict)
+                        and "Description" in item
+                        and "Name" in item
+                        and "Id" in item
+                    ):
+                        all_descriptions.append(item.get("Description", ""))
+                        all_names.append(item.get("Name", ""))
+                        all_ids.append(item.get("Id", None))
                     else:
-                        print(f"Ошибка: Файл '{filepath}' содержит объекты без ключей 'Description', 'Name' и 'Id'.")
+                        print(
+                            f"Ошибка: Файл '{filepath}' содержит объекты без ключей 'Description', 'Name' и 'Id'."
+                        )
                         success = False
                         break
             else:
-                print(f"Ошибка: Файл '{filepath}' содержит данные в неправильном формате. Ожидается список объектов.")
+                print(
+                    f"Ошибка: Файл '{filepath}' содержит данные в неправильном формате. Ожидается список объектов."
+                )
                 success = False
                 break
         if not success:
             break
 
     if success and all_descriptions:
-        preprocessed_names = [preprocess_text(name, stop_words, morph, punctuation_regex) for name in all_names]
-        preprocessed_descriptions = [preprocess_text(desc, stop_words, morph, punctuation_regex) for desc in all_descriptions]
+        preprocessed_names = [
+            preprocess_text(name, stop_words, morph, punctuation_regex)
+            for name in all_names
+        ]
+        preprocessed_descriptions = [
+            preprocess_text(desc, stop_words, morph, punctuation_regex)
+            for desc in all_descriptions
+        ]
 
-        df = pd.DataFrame({'id': all_ids, 'name': preprocessed_names, 'description': preprocessed_descriptions})
+        df = pd.DataFrame(
+            {
+                "id": all_ids,
+                "name": preprocessed_names,
+                "description": preprocessed_descriptions,
+            }
+        )
         return True
     else:
         return False
+
 
 # Функция загрузки стоп-слов
 def load_stopwords(filepath):
     global stop_words
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             loaded_stopwords = json.load(f)
         if isinstance(loaded_stopwords, list):
             stop_words = set(loaded_stopwords)
-        elif isinstance(loaded_stopwords, dict) and 'stop_words' in loaded_stopwords:
-            stop_words = set(loaded_stopwords['stop_words'])
+        elif (
+            isinstance(loaded_stopwords, dict) and "stop_words" in loaded_stopwords
+        ):
+            stop_words = set(loaded_stopwords["stop_words"])
         else:
-            print("Предупреждение: Неверный формат stopwords.json. Используется пустой список стоп-слов.")
+            print(
+                "Предупреждение: Неверный формат stopwords.json. Используется пустой список стоп-слов."
+            )
     except FileNotFoundError:
         print(f"Ошибка: Файл 'stopwords.json' не найден.")
         return None
@@ -151,28 +202,42 @@ def load_stopwords(filepath):
         print(f"Произошла ошибка при загрузке стоп-слов: {e}")
         return None
 
-def find_most_similar(reference_text, analysis_file_index, loaded_files, model, stop_words, morph, punctuation_regex, top_n=3):
+
+def find_most_similar(
+    reference_text,
+    analysis_file_index,
+    loaded_files,
+    model,
+    stop_words,
+    morph,
+    punctuation_regex,
+    top_n=3,
+):
     """Находит top_n наиболее похожих описаний в analysis_file_index относительно reference_text."""
     try:
-        target_desc = preprocess_text(reference_text, stop_words, morph, punctuation_regex)
+        target_desc = preprocess_text(
+            reference_text, stop_words, morph, punctuation_regex
+        )
         target_vector = model.get_sentence_vector(target_desc).reshape(1, -1)
 
         # Загружаем данные для анализа из выбранного файла
         analysis_filepath = loaded_files[analysis_file_index]
-        with open(analysis_filepath, 'r', encoding='utf-8') as f:
+        with open(analysis_filepath, "r", encoding="utf-8") as f:
             analysis_data = json.load(f)
 
         if not isinstance(analysis_data, list):
             print(f"Ошибка: Файл '{analysis_filepath}' не содержит список объектов.")
-            return "Ошибка: Файл анализа имеет неправильный формат.", []
+            return ["Ошибка: Файл анализа имеет неправильный формат."]
 
-        analysis_descriptions = [item.get('Description', '') for item in analysis_data]
-        analysis_names = [item.get('Name', '') for item in analysis_data]
-        analysis_ids = [item.get('Id', None) for item in analysis_data]
+        analysis_descriptions = [item.get("Description", "") for item in analysis_data]
+        analysis_names = [item.get("Name", "") for item in analysis_data]
+        analysis_ids = [item.get("Id", None) for item in analysis_data]
 
         similarities = []
         for i, desc in enumerate(analysis_descriptions):
-            processed_desc = preprocess_text(analysis_names[i] + " " + desc, stop_words, morph, punctuation_regex)
+            processed_desc = preprocess_text(
+                analysis_names[i] + " " + desc, stop_words, morph, punctuation_regex
+            )
             vector = model.get_sentence_vector(processed_desc).reshape(1, -1)
             similarity = cosine_similarity(target_vector, vector)[0][0]
             similarities.append(similarity)
@@ -180,86 +245,77 @@ def find_most_similar(reference_text, analysis_file_index, loaded_files, model, 
         similarities = np.array(similarities)
         most_similar_indices = np.argsort(similarities)[-top_n:][::-1]
 
-        result = [
-            f"Опорное описание:\n'{reference_text}'\n"
-            f"наиболее похоже на описание:\n'{analysis_descriptions[i]}' (Name: {analysis_names[i]}, Id: {analysis_ids[i]})\n"
+        results = [
+            f"Опорное описание: '{reference_text}'\n"
+            f"Наиболее похоже на описание: '{analysis_descriptions[i]}' (Name: {analysis_names[i]}, Id: {analysis_ids[i]})\n"
             f"(Сходство: {similarities[i]:.4f})"
             for i in most_similar_indices
         ]
-        results_data = [] #Объявляем локальную переменную
-        for i in most_similar_indices:
-            results_data.append({
-                "Опорное описание": reference_text,
-                "Похожее описание": analysis_descriptions[i],
-                "Имя": analysis_names[i],
-                "Id": analysis_ids[i],
-                "Сходство": similarities[i]
-            })
-        return result, results_data #Возвращаем и отформатированный текст и данные
+        return results
     except FileNotFoundError:
         print(f"Ошибка: Один из файлов не найден.")
-        return "Ошибка: Файл не найден.", []
+        return ["Ошибка: Файл не найден."]
     except json.JSONDecodeError:
         print(f"Ошибка: Некорректный формат JSON в одном из файлов.")
-        return "Ошибка: Некорректный формат JSON.", []
+        return ["Ошибка: Некорректный формат JSON."]
     except Exception as e:
         print(f"Произошла ошибка: {e}")
-        return f"Произошла ошибка: {e}", []
+        return [f"Произошла ошибка: {e}"]
+
 
 # Функция обучения FastText
 def train_model():
-    global model, model_save_path
+    global model
     try:
         # Создаем файл train.txt для обучения модели
-        train_file_path = 'train.txt'  # Определяем путь к файлу
-        with open(train_file_path, 'w', encoding='utf-8') as f:
-            for name, desc in zip(df['name'], df['description']):
-                f.write(name + '\n')
-                f.write(desc + '\n')
-        
-        
-        # Сохраняем модель
-        model.save_model(model_save_path)  # Используем путь по умолчанию
-        
+        train_file_path = "train.txt"  # Определяем путь к файлу
+        with open(train_file_path, "w", encoding="utf-8") as f:
+            for name, desc in zip(df["name"], df["description"]):
+                f.write(name + "\n")
+                f.write(desc + "\n")
+
+        # Обучаем модель
+        model = fasttext.train_unsupervised(
+            train_file_path, model="skipgram", dim=200, epoch=20, ws=5, minCount=5
+        )
+
         # Удаляем файл train.txt после его использования
         if os.path.exists(train_file_path):
             os.remove(train_file_path)
-            print(f"Файл {train_file_path} успешно удален.") # Добавляем сообщение об успешном удалении
+            print(f"Файл {train_file_path} успешно удален.")  # Добавляем сообщение об успешном удалении
         else:
-            print(f"Файл {train_file_path} не существует.") # Сообщаем, если файл не найден
-        
+            print(f"Файл {train_file_path} не существует.")  # Сообщаем, если файл не найден
+
         return True
     except Exception as e:
         print(f"Произошла ошибка при обучении модели: {e}")
         return False
 
-def save_results_to_file(results_data, output_path, file_format):
+
+def save_results_to_file(results_list, output_path, file_format):
     try:
         if file_format == "Текстовый файл":
-            with open(output_path, 'w', encoding='utf-8') as f:
-                for item in results_data:
-                    f.write(f"Опорное описание: {item['Опорное описание']}\n")
-                    f.write(f"Похожее описание: {item['Похожее описание']}\n")
-                    f.write(f"Имя: {item['Имя']}, Id: {item['Id']}\n")
-                    f.write(f"Сходство: {item['Сходство']:.4f}\n\n")
+            with open(output_path, "w", encoding="utf-8") as f:
+                for line in results_list:
+                    f.write(line + "\n\n")  # Добавляем разделение между результатами
 
         elif file_format == "Документ Word":
-            if Document is None: #Проверяем, что python-docx установлен
-                print("Невозможно сохранить в формате Word.  Библиотека python-docx не установлена.")
+            if Document is None:  # Проверяем, что python-docx установлен
+                print(
+                    "Невозможно сохранить в формате Word.  Библиотека python-docx не установлена."
+                )
                 return False
             document = Document()
-            for item in results_data:
-                document.add_paragraph(f"Опорное описание: {item['Опорное описание']}")
-                document.add_paragraph(f"Похожее описание: {item['Похожее описание']}")
-                document.add_paragraph(f"Имя: {item['Имя']}, Id: {item['Id']}\n")
-                document.add_paragraph(f"Сходство: {item['Сходство']:.4f}")
-                document.add_paragraph("") #Пустая строка для разделения
+            for line in results_list:
+                document.add_paragraph(line)
+                document.add_paragraph("")  # Разделение между результатами
 
             document.save(output_path)
         return True
     except Exception as e:
         print(f"Произошла ошибка при сохранении результатов: {e}")
         return False
+
 
 def load_model(path):
     global model
@@ -270,7 +326,82 @@ def load_model(path):
         print(f"Произошла ошибка при загрузке модели: {e}")
         return False
 
-def main(page: Page):
+
+def load_data_threaded(filepaths):  # Добавлена функция обратного вызова
+    global is_loading_data, all_descriptions, all_names, all_ids, df
+    is_loading_data = True
+    update_ui()
+
+    success = load_data_from_files(filepaths)
+    if success:
+        general_output.value = f"Данные успешно загружены из файлов"
+        show_snack_bar("Данные успешно загружены.")  # Show success SnackBar
+    else:
+        general_output.value = f"Ошибка при загрузке данных из файлов"
+
+    is_loading_data = False
+    update_ui()
+
+
+def save_model():
+    global model
+    try:
+        if model is not None:
+            file_extension = ".bin"
+            save_file_picker.save_file(file_name=f"fasttext_model{file_extension}")
+            return True
+        else:
+            print("Ошибка: Модель не загружена.")
+            return False
+    except Exception as e:
+        print(f"Произошла ошибка при сохранении модели: {e}")
+        return False
+
+
+def get_save_path(e: FilePickerResultEvent):
+    global output_folder, results_list  # Добавил results_list
+    if e.path:
+        output_path = e.path
+        try:
+            save_results_to_file(
+                results_list, output_path, selected_format
+            )  # Теперь передаем results_list
+            general_output.value = f"Результаты успешно сохранены в {output_path}"
+            show_snack_bar("Результаты успешно сохранены.")  # Show success SnackBar
+        except Exception as e:
+            general_output.value = f"Произошла ошибка при сохранении результатов: {e}"
+
+    else:
+        general_output.value = "Выбор пути сохранения отменен."
+    update_ui()
+
+
+# Объявляем update_ui как глобальную функцию
+update_ui = None
+
+
+def main(page_: ft.Page):
+    global (
+        page,
+        update_ui,
+        save_file_picker,
+        general_output,
+        get_data_path,
+        get_stopwords_path,
+        file_dropdown_changed,
+        format_changed,
+        pick_files_data,
+        pick_files_stopwords,
+        show_results_clicked,
+        save_results_button_clicked,
+        save_model_button_clicked,
+        pick_files_model,
+        get_model_path,
+        train_model_threaded,
+        results_list,
+    )  # Используем глобальные переменные
+
+    page = page_
     page.title = "Анализ текстовых описаний"
     page.vertical_alignment = ft.MainAxisAlignment.START
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
@@ -279,24 +410,20 @@ def main(page: Page):
     output_text = ""
     is_loading_data = False
     is_training_model = False
-    global selected_file_index, reference_text, results_data, results_text, selected_format, model  # Объявляем global
+    global selected_file_index, reference_text, selected_format, model  # Объявляем global
 
     def update_ui():
         page.update()
 
-    # ОПРЕДЕЛЯЕМ ВСЕ ФУНКЦИИ, ИСПОЛЬЗУЕМЫЕ В UI, ПЕРЕД ИХ ИСПОЛЬЗОВАНИЕМ
-    def pick_files_data(e):
-        data_button.disabled = True
-        data_button.bgcolor = ft.colors.GREEN
-        update_ui()
-        data_file_picker.pick_files(allow_multiple=True, allowed_extensions=["json"])
+    def show_snack_bar(message): # Define the snack bar function
+        page.show_snack_bar(
+            SnackBar(
+                Text(message),
+                open=True,
+            )
+        )
 
-    def pick_files_stopwords(e):
-        stopwords_button.disabled = True
-        stopwords_button.bgcolor = ft.colors.GREEN
-        update_ui()
-        stopwords_file_picker.pick_files(allowed_extensions=["json"])
-
+    # UI elements
     def get_data_path(e: FilePickerResultEvent):
         global is_loading_data
         is_loading_data = True
@@ -306,6 +433,7 @@ def main(page: Page):
             filepaths = [f.path for f in e.files]
             general_output.value = f"Выбрано файлов данных: {len(filepaths)}"
             load_data_threaded(filepaths)
+
             data_button.disabled = False
             data_button.bgcolor = None
 
@@ -314,7 +442,7 @@ def main(page: Page):
             for i, filepath in enumerate(loaded_files):
                 file_dropdown.options.append(dropdown.Option(key=i, text=filepath))
             file_dropdown.value = 0
-
+            show_snack_bar("Файлы данных успешно загружены.")  # Show success SnackBar
             is_loading_data = False
             update_ui()
         else:
@@ -332,10 +460,12 @@ def main(page: Page):
         if e.files:
             filepath = e.files[0].path
             general_output.value = f"Выбран файл стоп-слов: {filepath}"
-            success = load_stopwords_threaded(filepath)
+            # success = load_stopwords_threaded(filepath)
+            success = load_stopwords(filepath)
             if not success:
-              stopwords_button.disabled = False
-              stopwords_button.bgcolor = None
+                stopwords_button.disabled = False
+                stopwords_button.bgcolor = None
+            show_snack_bar("Файл стоп-слов успешно загружен.")  # Show success SnackBar
         else:
             general_output.value = "Выбор файла стоп-слов отменен!"
             stopwords_button.disabled = False
@@ -343,67 +473,34 @@ def main(page: Page):
         is_loading_data = False
         update_ui()
 
-    def load_data_threaded(filepaths):  # Добавлена функция обратного вызова
-        global is_loading_data, all_descriptions, all_names, all_ids, df
-        is_loading_data = True
+    def file_dropdown_changed(e):
+        global selected_file_index
+        selected_file_index = int(file_dropdown.value)
+        general_output.value = (
+            f"Выбран файл для анализа: {loaded_files[selected_file_index]}"
+        )
         update_ui()
 
-        success = load_data_from_files(filepaths)
-        if success:
-            general_output.value = f"Данные успешно загружены из файлов"
-        else:
-            general_output.value = f"Ошибка при загрузке данных из файлов"
-
-        is_loading_data = False
+    def format_changed(e):
+        global selected_format
+        selected_format = format_dropdown.value
+        print(f"Выбран формат: {selected_format}")
         update_ui()
 
-    def load_stopwords_threaded(file_path):
-        global is_loading_data
-        is_loading_data = True
+    def pick_files_data(e):
+        data_button.disabled = True
+        data_button.bgcolor = ft.colors.GREEN
         update_ui()
+        data_file_picker.pick_files(allow_multiple=True, allowed_extensions=["json"])
 
-        load_stopwords(file_path)
-        general_output.value = f"Стоп слова загружены"
-        return True  # Всегда возвращаем True (для простоты)
-
-    def train_model_threaded():
-        global is_training_model, model
-        is_training_model = True
-        train_button.disabled = True
-        train_button.bgcolor = ft.colors.GREEN
+    def pick_files_stopwords(e):
+        stopwords_button.disabled = True
+        stopwords_button.bgcolor = ft.colors.GREEN
         update_ui()
-
-        success = train_model()
-
-        train_button.disabled = False
-        train_button.bgcolor = None
-        general_output.value = f"Модель FastText успешно обучена и сохранена в {model_save_path}."
-
-        is_training_model = False
-        update_ui()
-
-    def pick_files_model(e):
-        model_button.disabled = True
-        model_button.bgcolor = ft.colors.GREEN
-        update_ui()
-        model_file_picker.pick_files(allowed_extensions=["bin"])
-
-    def get_model_path(e: FilePickerResultEvent):
-        if e.files:
-            filepath = e.files[0].path
-            general_output.value = f"Выбран файл модели: {filepath}"
-            if load_model(filepath):
-                general_output.value = f"Модель успешно загружена из файла {filepath}."
-            else:
-                general_output.value = "Ошибка при загрузке модели."
-        else:
-            general_output.value = "Выбор файла модели отменен!"
-        model_button.disabled = False
-        model_button.bgcolor = None
-        update_ui()
+        stopwords_file_picker.pick_files(allowed_extensions=["json"])
 
     def show_results_clicked(e):
-        global model, loaded_files, selected_file_index, reference_text, results_data, results_text
+        global model, loaded_files, selected_file_index, reference_text, results_list
 
         reference_text = reference_text_field.value  # Получаем текст из поля
 
@@ -417,51 +514,98 @@ def main(page: Page):
             update_ui()
             return
 
-        results, results_data = find_most_similar(reference_text, selected_file_index, loaded_files, model, stop_words, morph, punctuation_regex)
+        results_list = find_most_similar(
+            reference_text,
+            selected_file_index,
+            loaded_files,
+            model,
+            stop_words,
+            morph,
+            punctuation_regex,
+        )
 
-        if isinstance(results, str):
-            general_output.value = results
-            results_text.controls.clear() #Очищаем предыдущие результаты
+        if not isinstance(results_list, list):  # Исправил тут
+            general_output.value = results_list
+            results_text.controls.clear()  # Очищаем предыдущие результаты
+            show_snack_bar("Произошла ошибка во время анализа.")  # Show error SnackBar
         else:
             results_text.controls.clear()
-            for res in results:
+            for res in results_list:
                 results_text.controls.append(Text(value=res))
             general_output.value = "Результаты анализа получены."
+            show_snack_bar("Результаты успешно получены.")  # Show success SnackBar
 
-        update_ui()
-
-    def file_dropdown_changed(e):
-        global selected_file_index
-        selected_file_index = int(file_dropdown.value)
-        general_output.value = f"Выбран файл для анализа: {loaded_files[selected_file_index]}"
         update_ui()
 
     def save_results_button_clicked(e):
-        file_extension = ".txt" if selected_format == "Текстовый файл" else ".doc" #Определяем расширение файла
+        file_extension = (
+            ".txt" if selected_format == "Текстовый файл" else ".doc"
+        )  # Определяем расширение файла
         save_file_picker.save_file(file_name=f"results{file_extension}")
 
-    def get_save_path(e: FilePickerResultEvent):
-        global output_folder, selected_format
-        if e.path:
-            output_path = e.path
-            if save_results_to_file(results_data, output_path, selected_format):
-                general_output.value = f"Результаты успешно сохранены в {output_path}"
+    def save_model_button_clicked(e):
+        save_model()
+
+    def pick_files_model(e):
+        model_button.disabled = True
+        model_button.bgcolor = ft.colors.GREEN
+        update_ui()
+        model_file_picker.pick_files(allowed_extensions=["bin"])
+
+    def get_model_path(e: FilePickerResultEvent):
+        if e.files:
+            filepath = e.files[0].path
+            general_output.value = f"Выбран файл модели: {filepath}"
+            if load_model(filepath):
+                general_output.value = f"Модель успешно загружена из файла {filepath}."
+                show_snack_bar("Модель успешно загружена.")  # Show success SnackBar
             else:
-                general_output.value = "Ошибка при сохранении результатов."
+                general_output.value = "Ошибка при загрузке модели."
+                show_snack_bar("Произошла ошибка во время загрузки модели.")  # Show success SnackBar
         else:
-            general_output.value = "Выбор пути сохранения отменен."
+            general_output.value = "Выбор файла модели отменен!"
+        model_button.disabled = False
+        model_button.bgcolor = None
         update_ui()
 
-    def format_changed(e):
-        global selected_format
-        selected_format = format_dropdown.value
-        print(f"Выбран формат: {selected_format}")
+    def train_model_threaded():
+        global is_training_model, model
+        is_training_model = True
+        train_button.disabled = True
+        train_button.bgcolor = ft.colors.GREEN
         update_ui()
 
-    # UI elements
+        success = train_model()
+
+        train_button.disabled = False
+        train_button.bgcolor = None
+        if success:
+            general_output.value = "Модель FastText успешно обучена."  # Сообщение об успехе
+            show_snack_bar("Модель FastText успешно обучена.")  # Show success SnackBar
+        else:
+            general_output.value = "Ошибка при обучении модели."  # Сообщение об ошибке
+
+        is_training_model = False
+        update_ui()
+
+    globals()["get_data_path"] = get_data_path
+    globals()["get_stopwords_path"] = get_stopwords_path
+    globals()["file_dropdown_changed"] = file_dropdown_changed
+    globals()["format_changed"] = format_changed
+    globals()["pick_files_data"] = pick_files_data
+    globals()["pick_files_stopwords"] = pick_files_stopwords
+    globals()["show_results_clicked"] = show_results_clicked
+    globals()["save_results_button_clicked"] = save_results_button_clicked
+    globals()["save_model_button_clicked"] = save_model_button_clicked
+    globals()["pick_files_model"] = pick_files_model
+    globals()["get_model_path"] = get_model_path
+    globals()["train_model_threaded"] = train_model_threaded
+
     data_file_picker = FilePicker(on_result=get_data_path)
     stopwords_file_picker = FilePicker(on_result=get_stopwords_path)
-    save_file_picker = FilePicker(on_result=get_save_path)
+    save_file_picker = FilePicker(
+        on_result=get_save_path
+    )  # Инициализируем здесь
     model_file_picker = FilePicker(on_result=get_model_path)
 
     file_dropdown = Dropdown(
@@ -472,13 +616,12 @@ def main(page: Page):
         width=300,
     )
 
-    reference_text_field = TextField(label="Опорное описание", multiline=True, width=500)
+    reference_text_field = TextField(
+        label="Опорное описание", multiline=True, width=500
+    )
 
     format_dropdown = Dropdown(
-        options=[
-            dropdown.Option("Текстовый файл"),
-            dropdown.Option("Документ Word"),
-        ],
+        options=[dropdown.Option("Текстовый файл"), dropdown.Option("Документ Word")],
         value="Текстовый файл",
         label="Формат сохранения",
         on_change=format_changed,
@@ -486,13 +629,24 @@ def main(page: Page):
     )
 
     # Кнопки
+    train_button = ElevatedButton(
+        "Обучить модель FastText",
+        on_click=lambda _: threading.Thread(target=train_model_threaded).start(),
+        disabled=is_training_model,
+    )
     data_button = ElevatedButton("Загрузить данные", on_click=pick_files_data)
-    stopwords_button = ElevatedButton("Загрузить стоп-слова (stopwords.json)", on_click=pick_files_stopwords)
-    train_button = ElevatedButton("Обучить модель FastText", on_click=lambda _: threading.Thread(target=train_model_threaded).start(),
-                       disabled=is_training_model)
+    stopwords_button = ElevatedButton(
+        "Загрузить стоп-слова (stopwords.json)", on_click=pick_files_stopwords
+    )
+
     model_button = ElevatedButton("Загрузить модель", on_click=pick_files_model)
     show_results_button = ElevatedButton("Вывести результаты", on_click=show_results_clicked)
-    save_results_button = ElevatedButton("Сохранить результаты", on_click=save_results_button_clicked)  # Кнопка "Сохранить результаты"
+    save_results_button = ElevatedButton(
+        "Сохранить результаты", on_click=save_results_button_clicked
+    )  # Кнопка "Сохранить результаты"
+    save_model_button = ElevatedButton(
+        "Сохранить модель", on_click=save_model_button_clicked
+    )  # Кнопка "Сохранить модель"
 
     # Инициализируем general_output перед использованием
     general_output = Text("")
@@ -506,18 +660,33 @@ def main(page: Page):
     page.overlay.append(model_file_picker)
 
     page.add(
-        data_button,
-        stopwords_button,
-        train_button,
-        model_button,
+        ft.Row(
+            [data_button, stopwords_button], alignment=ft.MainAxisAlignment.CENTER
+        ),
+        ft.Row([train_button, model_button], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row(
+            [show_results_button, save_results_button],
+            alignment=ft.MainAxisAlignment.CENTER,
+        ),
+        ft.Row([save_model_button], alignment=ft.MainAxisAlignment.CENTER),
         reference_text_field,
-        file_dropdown,
-        format_dropdown,
-        show_results_button,
-        save_results_button,  # Кнопка "Сохранить результаты"
+        ft.Row(
+            [file_dropdown, format_dropdown], alignment=ft.MainAxisAlignment.CENTER
+        ),
         general_output,
-        results_text
+        results_text,
     )
+    # Присваиваем функцию update_ui глобальной переменной
+    globals()["update_ui"] = update_ui
+
+    # Add SnackBar
+    def show_snack_bar(message): # Define the snack bar function
+        page.show_snack_bar(
+            SnackBar(
+                Text(message),
+                open=True,
+            )
+        )
 
 if __name__ == "__main__":
     ft.app(target=main)
