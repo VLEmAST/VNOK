@@ -45,7 +45,7 @@ morph = pymorphy3.MorphAnalyzer()
 stop_words = set()
 all_descriptions = []
 all_names = []
-all_ids = []
+# all_ids = []  # Удалена переменная all_ids
 model = None
 df = None
 punctuation_regex = re.compile(f"[{re.escape(string.punctuation)}]")
@@ -75,6 +75,7 @@ pick_files_model = None
 get_model_path = None
 train_model_threaded = None
 results_list = []  # Список для хранения результатов
+full_file_name_text = None  # Text element to display the full file name
 
 
 # Функция предобработки текста
@@ -118,10 +119,10 @@ def load_data(filepath):
 
 
 def load_data_from_files(filepaths):
-    global all_descriptions, all_names, all_ids, df, loaded_files
+    global all_descriptions, all_names, df, loaded_files
     all_descriptions = []
     all_names = []
-    all_ids = []
+    # all_ids = []  # Удалена переменная all_ids
     loaded_files = filepaths  # Сохраняем список файлов
     success = True
 
@@ -134,14 +135,15 @@ def load_data_from_files(filepaths):
                         isinstance(item, dict)
                         and "Description" in item
                         and "Name" in item
-                        and "Id" in item
-                    ):
+                    ):  # Удаляем проверку на Id
                         all_descriptions.append(item.get("Description", ""))
                         all_names.append(item.get("Name", ""))
-                        all_ids.append(item.get("Id", None))
+                        # all_ids.append(item.get("Id", None))  # Удаляем добавление Id
+                        # if 'Id' in item:
+                        #     del item['Id'] # Удаляем Id из item
                     else:
                         print(
-                            f"Ошибка: Файл '{filepath}' содержит объекты без ключей 'Description', 'Name' и 'Id'."
+                            f"Ошибка: Файл '{filepath}' содержит объекты без ключей 'Description' и 'Name'."  # Удаляем упоминание Id
                         )
                         success = False
                         break
@@ -166,7 +168,7 @@ def load_data_from_files(filepaths):
 
         df = pd.DataFrame(
             {
-                "id": all_ids,
+                # 'id': all_ids,  # Удаляем столбец id
                 "name": preprocessed_names,
                 "description": preprocessed_descriptions,
             }
@@ -231,7 +233,7 @@ def find_most_similar(
 
         analysis_descriptions = [item.get("Description", "") for item in analysis_data]
         analysis_names = [item.get("Name", "") for item in analysis_data]
-        analysis_ids = [item.get("Id", None) for item in analysis_data]
+        # analysis_ids = [item.get("Id", None) for item in analysis_data] #Удаляем
 
         similarities = []
         for i, desc in enumerate(analysis_descriptions):
@@ -247,7 +249,7 @@ def find_most_similar(
 
         results = [
             f"Опорное описание: '{reference_text}'\n"
-            f"Наиболее похоже на описание: '{analysis_descriptions[i]}' (Name: {analysis_names[i]}, Id: {analysis_ids[i]})\n"
+            f"Наиболее похоже на описание: '{analysis_descriptions[i]}' (Name: {analysis_names[i]})\n"  # Удаляем Id
             f"(Сходство: {similarities[i]:.4f})"
             for i in most_similar_indices
         ]
@@ -328,7 +330,7 @@ def load_model(path):
 
 
 def load_data_threaded(filepaths):  # Добавлена функция обратного вызова
-    global is_loading_data, all_descriptions, all_names, all_ids, df
+    global is_loading_data, all_descriptions, all_names, df
     is_loading_data = True
     update_ui()
 
@@ -381,25 +383,8 @@ update_ui = None
 
 
 def main(page_: ft.Page):
-    global (
-        page,
-        update_ui,
-        save_file_picker,
-        general_output,
-        get_data_path,
-        get_stopwords_path,
-        file_dropdown_changed,
-        format_changed,
-        pick_files_data,
-        pick_files_stopwords,
-        show_results_clicked,
-        save_results_button_clicked,
-        save_model_button_clicked,
-        pick_files_model,
-        get_model_path,
-        train_model_threaded,
-        results_list,
-    )  # Используем глобальные переменные
+    global page, update_ui, save_file_picker, general_output, get_data_path, get_stopwords_path, file_dropdown_changed, format_changed, pick_files_data, pick_files_stopwords, show_results_clicked, save_results_button_clicked, save_model_button_clicked, pick_files_model, get_model_path, train_model_threaded, show_snack_bar, results_list, full_file_name_text, selected_format  # Используем глобальные переменные
+
 
     page = page_
     page.title = "Анализ текстовых описаний"
@@ -410,22 +395,31 @@ def main(page_: ft.Page):
     output_text = ""
     is_loading_data = False
     is_training_model = False
-    global selected_file_index, reference_text, selected_format, model  # Объявляем global
+    global selected_file_index, reference_text, model  # Объявляем global
+
+    page.snack_bar = SnackBar(content=Text(""))  # Init SnackBar
 
     def update_ui():
         page.update()
 
-    def show_snack_bar(message): # Define the snack bar function
-        page.show_snack_bar(
-            SnackBar(
-                Text(message),
-                open=True,
-            )
-        )
+    # Use page.show_snack() to display SnackBar
+    def show_snack_bar(message):
+        page.snack_bar.content = Text(message)
+        page.snack_bar.open = True
+        update_ui()
+
+    def get_file_name(filepath):
+        return os.path.basename(filepath)
+
+    def truncate_string(text, max_length):
+        if len(text) > max_length:
+            return text[: max_length - 3] + "..."
+        else:
+            return text
 
     # UI elements
     def get_data_path(e: FilePickerResultEvent):
-        global is_loading_data
+        global is_loading_data, loaded_files
         is_loading_data = True
         update_ui()
 
@@ -440,8 +434,16 @@ def main(page_: ft.Page):
             # После завершения загрузки данных обновляем выпадающие списки
             file_dropdown.options.clear()
             for i, filepath in enumerate(loaded_files):
-                file_dropdown.options.append(dropdown.Option(key=i, text=filepath))
+                filename = get_file_name(filepath)  # Get only the file name
+                truncated_filename = truncate_string(filename, 25)  # Обрезаем имя файла
+                file_dropdown.options.append(
+                    dropdown.Option(key=i, text=truncated_filename)
+                )  # Используем обрезанное имя
             file_dropdown.value = 0
+            if loaded_files:
+                full_file_name_text.value = loaded_files[0]
+            else:
+                full_file_name_text.value = ""
             show_snack_bar("Файлы данных успешно загружены.")  # Show success SnackBar
             is_loading_data = False
             update_ui()
@@ -474,8 +476,9 @@ def main(page_: ft.Page):
         update_ui()
 
     def file_dropdown_changed(e):
-        global selected_file_index
+        global selected_file_index, full_file_name_text
         selected_file_index = int(file_dropdown.value)
+        full_file_name_text.value = loaded_files[selected_file_index]  # Устанавливаем полное имя файла
         general_output.value = (
             f"Выбран файл для анализа: {loaded_files[selected_file_index]}"
         )
@@ -600,6 +603,8 @@ def main(page_: ft.Page):
     globals()["pick_files_model"] = pick_files_model
     globals()["get_model_path"] = get_model_path
     globals()["train_model_threaded"] = train_model_threaded
+    globals()["full_file_name_text"] = full_file_name_text #Добавлено чтобы не было ошибки
+    globals()["selected_format"] = selected_format #Добавлено чтобы не было ошибки
 
     data_file_picker = FilePicker(on_result=get_data_path)
     stopwords_file_picker = FilePicker(on_result=get_stopwords_path)
@@ -654,6 +659,9 @@ def main(page_: ft.Page):
     # Инициализируем results_text перед использованием
     results_text = ListView(expand=True, spacing=10, auto_scroll=True)
 
+    # Text element to display the full file name
+    full_file_name_text = Text(value="")
+
     page.overlay.append(data_file_picker)
     page.overlay.append(stopwords_file_picker)
     page.overlay.append(save_file_picker)
@@ -673,20 +681,16 @@ def main(page_: ft.Page):
         ft.Row(
             [file_dropdown, format_dropdown], alignment=ft.MainAxisAlignment.CENTER
         ),
+        full_file_name_text,  # Added Text to display the full file name
         general_output,
         results_text,
     )
     # Присваиваем функцию update_ui глобальной переменной
     globals()["update_ui"] = update_ui
 
-    # Add SnackBar
-    def show_snack_bar(message): # Define the snack bar function
-        page.show_snack_bar(
-            SnackBar(
-                Text(message),
-                open=True,
-            )
-        )
+    # Init SnackBar
+    page.snack_bar = SnackBar(content=Text(""))
+
 
 if __name__ == "__main__":
     ft.app(target=main)
