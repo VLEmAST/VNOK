@@ -60,7 +60,8 @@ selected_file_index = 0  # Индекс файла для анализа
 reference_text = ""  # Текст "опорного" описания
 selected_format = "Текстовый файл"  # Формат сохранения по умолчанию
 page = None  # Глобальная переменная для Page
-save_file_picker = None  # Объявляем save_file_picker как глобальную переменную
+results_save_file_picker = None #FilePicker для сохранения результатов
+model_save_file_picker = None #FilePicker для сохранения модели
 general_output = None  # Объявляем general_output как глобальную переменную
 get_data_path = None
 get_stopwords_path = None
@@ -269,22 +270,49 @@ def find_most_similar(
 def train_model():
     global model
     try:
-        # Создаем файл train.txt для обучения модели
+        # Создаем или открываем файл train.txt для обучения модели
         train_file_path = "train.txt"  # Определяем путь к файлу
-        with open(train_file_path, "w", encoding="utf-8") as f:
+        # 'a' - append mode, добавляем данные в конец файла
+        with open(train_file_path, "a", encoding="utf-8") as f:
             for name, desc in zip(df["name"], df["description"]):
                 f.write(name + "\n")
                 f.write(desc + "\n")
 
         # Обучаем модель
-        model = fasttext.train_unsupervised(
-            train_file_path, model="skipgram", dim=200, epoch=20, ws=5, minCount=5
-        )
+        # Если модель уже загружена, используем ее, иначе создаем новую
+        if model is None:
+            model = fasttext.train_unsupervised(
+                train_file_path,
+                model="skipgram",
+                dim=200,
+                epoch=20,
+                ws=5,
+                minCount=5,
+            )
+        else:
+            # Дообучение - это сложная задача для fasttext.  В данном случае,
+            # наиболее простой вариант - просто добавить новые данные в файл
+            # и переобучить модель с нуля.  Однако, это может быть неэффективно
+            # для больших объемов данных.
+
+            # В fasttext нет явной функции для "дообучения".
+            # Решением может быть только повторное обучение на всём датасете.
+
+            model = fasttext.train_unsupervised(
+                train_file_path,
+                model="skipgram",
+                dim=200,
+                epoch=20,
+                ws=5,
+                minCount=5,
+            )
 
         # Удаляем файл train.txt после его использования
         if os.path.exists(train_file_path):
-            os.remove(train_file_path)
-            print(f"Файл {train_file_path} успешно удален.")  # Добавляем сообщение об успешном удалении
+            os.remove(
+                train_file_path
+            )  # Добавляем сообщение об успешном удалении
+            print(f"Файл {train_file_path} успешно удален.")
         else:
             print(f"Файл {train_file_path} не существует.")  # Сообщаем, если файл не найден
 
@@ -322,7 +350,12 @@ def save_results_to_file(results_list, output_path, file_format):
 def load_model(path):
     global model
     try:
+        print(f"Попытка загрузить модель из: {path}")  # Выводим путь
+        if not os.path.exists(path):
+            print(f"Ошибка: Файл не найден по пути {path}")
+            return False
         model = fasttext.load_model(path)
+        print("Модель успешно загружена.")
         return True
     except Exception as e:
         print(f"Произошла ошибка при загрузке модели: {e}")
@@ -346,11 +379,11 @@ def load_data_threaded(filepaths):  # Добавлена функция обра
 
 
 def save_model():
-    global model
+    global model, model_save_file_picker
     try:
         if model is not None:
             file_extension = ".bin"
-            save_file_picker.save_file(file_name=f"fasttext_model{file_extension}")
+            model_save_file_picker.save_file(file_name=f"fasttext_model{file_extension}")  # Запускаем FilePicker для выбора пути
             return True
         else:
             print("Ошибка: Модель не загружена.")
@@ -359,9 +392,15 @@ def save_model():
         print(f"Произошла ошибка при сохранении модели: {e}")
         return False
 
+def save_results(): #Функция для запуска сохранения результатов
+    global results_save_file_picker
+    file_extension = (
+            ".txt" if selected_format == "Текстовый файл" else ".doc"
+        )  # Определяем расширение файла
+    results_save_file_picker.save_file(file_name=f"results{file_extension}")
 
-def get_save_path(e: FilePickerResultEvent):
-    global output_folder, results_list  # Добавил results_list
+def get_results_save_path(e: FilePickerResultEvent):
+    global output_folder, results_list, general_output  # Добавил results_list
     if e.path:
         output_path = e.path
         try:
@@ -377,13 +416,27 @@ def get_save_path(e: FilePickerResultEvent):
         general_output.value = "Выбор пути сохранения отменен."
     update_ui()
 
+def get_model_save_path(e: FilePickerResultEvent):
+    global model, general_output
+    if e.path:
+        output_path = e.path
+        try:
+            model.save_model(output_path)  # Сохраняем модель
+            general_output.value = f"Модель успешно сохранена в {output_path}"
+            show_snack_bar("Модель успешно сохранена.")
+        except Exception as e:
+            general_output.value = f"Произошла ошибка при сохранении модели: {e}"
+    else:
+        general_output.value = "Выбор пути сохранения отменен."
+    update_ui()
+
 
 # Объявляем update_ui как глобальную функцию
 update_ui = None
 
 
 def main(page_: ft.Page):
-    global page, update_ui, save_file_picker, general_output, get_data_path, get_stopwords_path, file_dropdown_changed, format_changed, pick_files_data, pick_files_stopwords, show_results_clicked, save_results_button_clicked, save_model_button_clicked, pick_files_model, get_model_path, train_model_threaded, show_snack_bar, results_list, full_file_name_text, selected_format  # Используем глобальные переменные
+    global page, update_ui, results_save_file_picker, model_save_file_picker, general_output, get_data_path, get_stopwords_path, file_dropdown_changed, format_changed, pick_files_data, pick_files_stopwords, show_results_clicked, save_results_button_clicked, save_model_button_clicked, pick_files_model, get_model_path, train_model_threaded, show_snack_bar, results_list, full_file_name_text, selected_format  # Используем глобальные переменные
 
 
     page = page_
@@ -435,7 +488,9 @@ def main(page_: ft.Page):
             file_dropdown.options.clear()
             for i, filepath in enumerate(loaded_files):
                 filename = get_file_name(filepath)  # Get only the file name
-                truncated_filename = truncate_string(filename, 25)  # Обрезаем имя файла
+                truncated_filename = truncate_string(
+                    filename, 25
+                )  # Обрезаем имя файла
                 file_dropdown.options.append(
                     dropdown.Option(key=i, text=truncated_filename)
                 )  # Используем обрезанное имя
@@ -541,10 +596,7 @@ def main(page_: ft.Page):
         update_ui()
 
     def save_results_button_clicked(e):
-        file_extension = (
-            ".txt" if selected_format == "Текстовый файл" else ".doc"
-        )  # Определяем расширение файла
-        save_file_picker.save_file(file_name=f"results{file_extension}")
+        save_results()
 
     def save_model_button_clicked(e):
         save_model()
@@ -603,14 +655,15 @@ def main(page_: ft.Page):
     globals()["pick_files_model"] = pick_files_model
     globals()["get_model_path"] = get_model_path
     globals()["train_model_threaded"] = train_model_threaded
-    globals()["full_file_name_text"] = full_file_name_text #Добавлено чтобы не было ошибки
-    globals()["selected_format"] = selected_format #Добавлено чтобы не было ошибки
+    globals()["full_file_name_text"] = full_file_name_text  # Добавлено чтобы не было ошибки
+    globals()["selected_format"] = selected_format  # Добавлено чтобы не было ошибки
+    globals()["results_save_file_picker"] = results_save_file_picker
+    globals()["model_save_file_picker"] = model_save_file_picker
 
     data_file_picker = FilePicker(on_result=get_data_path)
     stopwords_file_picker = FilePicker(on_result=get_stopwords_path)
-    save_file_picker = FilePicker(
-        on_result=get_save_path
-    )  # Инициализируем здесь
+    results_save_file_picker = FilePicker(on_result=get_results_save_path) #FilePicker для сохранения результатов
+    model_save_file_picker = FilePicker(on_result=get_model_save_path) #FilePicker для сохранения модели
     model_file_picker = FilePicker(on_result=get_model_path)
 
     file_dropdown = Dropdown(
@@ -664,7 +717,8 @@ def main(page_: ft.Page):
 
     page.overlay.append(data_file_picker)
     page.overlay.append(stopwords_file_picker)
-    page.overlay.append(save_file_picker)
+    page.overlay.append(results_save_file_picker) #Добавлены FilePicker
+    page.overlay.append(model_save_file_picker) #Добавлены FilePicker
     page.overlay.append(model_file_picker)
 
     page.add(
