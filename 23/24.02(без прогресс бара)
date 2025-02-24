@@ -649,9 +649,6 @@ def main(page_: ft.Page):
         global selected_file_index, full_file_name_text
         selected_file_index = int(file_dropdown.value)
         full_file_name_text.value = loaded_files[selected_file_index]  # Устанавливаем полное имя файла
-        general_output.value = (
-            f"Выбран файл для анализа: {loaded_files[selected_file_index]}"
-        )
         update_ui()
 
     def format_changed(e):
