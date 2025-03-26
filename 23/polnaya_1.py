@@ -78,6 +78,10 @@ train_model_threaded = None
 results_list = []  # Список для хранения результатов
 full_file_name_text = None  # Text element to display the full file name
 
+# Новые глобальные переменные для путей к файлам угроз и уязвимостей
+threat_file_path = None
+vulnerability_file_path = None
+
 
 # Функция предобработки текста
 def preprocess_text(text, stop_words, morph, punctuation_regex):
@@ -248,8 +252,7 @@ def load_stopwords(filepath):
 
 def find_most_similar(
     reference_text,
-    analysis_file_index,
-    loaded_files,
+    analysis_data, #Изменили с file_index на data
     model,
     stop_words,
     morph,
@@ -263,14 +266,11 @@ def find_most_similar(
         )
         target_vector = model.get_sentence_vector(target_desc).reshape(1, -1)
 
-        # Загружаем данные для анализа из выбранного файла
-        analysis_filepath = loaded_files[analysis_file_index]
-        with open(analysis_filepath, "r", encoding="utf-8") as f:
-            analysis_data = json.load(f)
+        #Больше не загружаем, а используем переданные данные
 
         if not isinstance(analysis_data, list):
-            print(f"Ошибка: Файл '{analysis_filepath}' не содержит список объектов.")
-            return ["Ошибка: Файл анализа имеет неправильный формат."]
+            print(f"Ошибка: analysis_data не содержит список объектов.")
+            return ["Ошибка: analysis_data имеет неправильный формат."]
 
         analysis_descriptions = [item.get("Description", "") for item in analysis_data]
         analysis_names = [item.get("Name", "") for item in analysis_data]
@@ -480,7 +480,7 @@ update_ui = None
 
 
 def main(page_: ft.Page):
-    global page, update_ui, results_save_file_picker, model_save_file_picker, general_output, get_data_path, get_stopwords_path, file_dropdown_changed, format_changed, pick_files_data, pick_files_stopwords, show_results_clicked, save_results_button_clicked, save_model_button_clicked, pick_files_model, get_model_path, train_model_threaded, show_snack_bar, results_list, full_file_name_text, selected_format  # Используем глобальные переменные
+    global page, update_ui, results_text, results_save_file_picker, model_save_file_picker, general_output, get_data_path, get_stopwords_path, file_dropdown_changed, format_changed, pick_files_data, pick_files_stopwords, show_results_clicked, save_results_button_clicked, save_model_button_clicked, pick_files_model, get_model_path, train_model_threaded, show_snack_bar, results_list, full_file_name_text, selected_format, threat_file_path, vulnerability_file_path  # Используем глобальные переменные
 
 
     page = page_
@@ -616,26 +616,40 @@ def main(page_: ft.Page):
             update_ui()
             return
 
-        results_list = find_most_similar(
-            reference_text,
-            selected_file_index,
-            loaded_files,
-            model,
-            stop_words,
-            morph,
-            punctuation_regex,
-        )
+        if not loaded_files:
+            general_output.value = "Ошибка: Сначала загрузите файлы данных."
+            update_ui()
+            return
 
-        if not isinstance(results_list, list):  # Исправил тут
-            general_output.value = results_list
-            results_text.controls.clear()  # Очищаем предыдущие результаты
-            show_snack_bar("Произошла ошибка во время анализа.")  # Show error SnackBar
-        else:
-            results_text.controls.clear()
-            for res in results_list:
-                results_text.controls.append(Text(value=res))
-            general_output.value = "Результаты анализа получены."
-            show_snack_bar("Результаты успешно получены.")  # Show success SnackBar
+        if selected_file_index is None or selected_file_index < 0 or selected_file_index >= len(loaded_files):
+            general_output.value = "Ошибка: Выберите файл для анализа."
+            update_ui()
+            return
+
+        try: #Оборачиваем вызов find_most_similar в try...except
+            results_list = find_most_similar(
+                reference_text,
+                loaded_files[selected_file_index],  # Отправляем данные
+                model,
+                stop_words,
+                morph,
+                punctuation_regex,
+            )
+
+            if not isinstance(results_list, list):
+                general_output.value = results_list
+                results_text.controls.clear()
+                show_snack_bar("Произошла ошибка во время анализа.")
+            else:
+                results_text.controls.clear()
+                for res in results_list:
+                    results_text.controls.append(Text(value=res))
+                general_output.value = "Результаты анализа получены."
+                show_snack_bar("Результаты успешно получены.")
+
+        except IndexError as e: #Перехватываем ошибку IndexError
+            general_output.value = f"Ошибка IndexError: {e}. Пожалуйста, выберите файл для анализа."
+            show_snack_bar("Произошла ошибка IndexError.")
 
         update_ui()
 
@@ -687,6 +701,155 @@ def main(page_: ft.Page):
         is_training_model = False
         update_ui()
 
+    # Новые функции для выбора файлов угроз и уязвимостей
+    def pick_threat_file(e):
+        threat_file_picker.pick_files(allowed_extensions=["json"])
+
+    def pick_vulnerability_file(e):
+        vulnerability_file_picker.pick_files(allowed_extensions=["json"])
+
+    def get_threat_file_path(e):
+        global threat_file_path
+        if e.files:
+            threat_file_path = e.files[0].path
+            general_output.value = f"Выбран файл угроз: {threat_file_path}"
+        else:
+            general_output.value = "Выбор файла угроз отменен!"
+        update_ui()
+
+    def get_vulnerability_file_path(e):
+        global vulnerability_file_path
+        if e.files:
+            vulnerability_file_path = e.files[0].path
+            general_output.value = f"Выбран файл уязвимостей: {vulnerability_file_path}"
+        else:
+            general_output.value = "Выбор файла уязвимостей отменен!"
+        update_ui()
+
+    def compare_threats_vulnerabilities_clicked(e):
+        global model, threat_file_path, vulnerability_file_path, results_list, selected_cvss_vector, stop_words, morph, punctuation_regex, results_text, general_output
+
+        if model is None:
+            general_output.value = "Ошибка: Сначала обучите модель."
+            update_ui()
+            return
+
+        if not threat_file_path or not vulnerability_file_path:
+            general_output.value = "Ошибка: Выберите файлы угроз и уязвимостей."
+            update_ui()
+            return
+
+        results_list.clear()
+
+        try:
+            # Загружаем данные из файлов угроз и уязвимостей
+            with open(threat_file_path, "r", encoding="utf-8") as f1:
+                threat_data = json.load(f1)
+
+            with open(vulnerability_file_path, "r", encoding="utf-8") as f2:
+                vulnerability_data = json.load(f2)
+
+            # Находим самые похожие угрозы
+            similar_threats = find_most_similar(
+                reference_text_field.value, #Используем текст из поля
+                threat_data, #Передаем данные, а не индекс
+                model,
+                stop_words,
+                morph,
+                punctuation_regex,
+                top_n=5 #Например, 5 самых похожих угроз
+            )
+
+            if not isinstance(similar_threats, list):
+                general_output.value = similar_threats
+                results_text.controls.clear()
+                show_snack_bar("Произошла ошибка при поиске угроз.")
+                update_ui()
+                return
+
+            # Формируем список имен самых похожих угроз
+            similar_threat_names = [item.split("(Name: ")[1].split(")")[0] for item in similar_threats if "(Name: " in item]
+
+            # Сопоставляем угрозы с уязвимостями и выводим результаты
+            for threat_result in similar_threats:
+                results_list.append(threat_result + "\n")
+
+                # Получаем имя угрозы для поиска похожих уязвимостей
+                threat_name = threat_result.split("(Name: ")[1].split(")")[0]
+
+                # Получаем данные угрозы для фильтрации уязвимостей
+                threat_item = next((item for item in threat_data if item.get("Name") == threat_name), None)
+
+                if threat_item is None:
+                    results_list.append(f"  -> Ошибка: Не удалось найти полную информацию об угрозе '{threat_name}'.\n")
+                    continue
+
+                privacy_violation = threat_item.get("PrivacyViolation", "0")
+                integrity_violation = threat_item.get("IntegrityViolation", "0")
+                accessibility_violation = threat_item.get("AccessibilityViolation", "0")
+
+                # Фильтруем уязвимости по CVSS на основе свойств угрозы
+                filtered_vulnerabilities = []
+                for vuln in vulnerability_data:
+                    vuln_cvss = vuln.get("CVSS2", "")
+
+                    # Проверяем соответствие PrivacyViolation
+                    privacy_match = (privacy_violation == "1" and "C:C" in vuln_cvss) or \
+                                    (privacy_violation == "0" and "C:C" not in vuln_cvss)
+
+                    # Проверяем соответствие IntegrityViolation
+                    integrity_match = (integrity_violation == "1" and "I:C" in vuln_cvss) or \
+                                    (integrity_violation == "0" and "I:C" not in vuln_cvss)
+
+                    # Проверяем соответствие AccessibilityViolation
+                    accessibility_match = (accessibility_violation == "1" and "A:C" in vuln_cvss) or \
+                                        (accessibility_violation == "0" and "A:C" not in vuln_cvss)
+
+                    # Уязвимость добавляется в список, только если все три соответствия истинны
+                    if privacy_match and integrity_match and accessibility_match:
+                        filtered_vulnerabilities.append(vuln)
+
+                # Находим наиболее похожие уязвимости для текущей угрозы
+                vulnerability_similarities = [] #Список кортежей (уязвимость, схожесть)
+
+                for vuln in filtered_vulnerabilities:
+                    vuln_name = vuln.get("Name", "Не указано")
+                    vuln_description = vuln.get("Description", "Нет описания")
+                    vuln_text = vuln_name + " " + vuln_description
+
+                    processed_vuln_text = preprocess_text(vuln_text, stop_words, morph, punctuation_regex)
+
+                    threat_vector = model.get_sentence_vector(preprocess_text(threat_name, stop_words, morph, punctuation_regex)).reshape(1, -1)
+                    vuln_vector = model.get_sentence_vector(processed_vuln_text).reshape(1, -1)
+
+                    similarity = cosine_similarity(threat_vector, vuln_vector)[0][0]
+                    vulnerability_similarities.append((vuln, similarity))
+
+                # Сортируем уязвимости по схожести
+                sorted_vulnerabilities = sorted(vulnerability_similarities, key=lambda item: item[1], reverse=True)
+
+                # Выводим топ 3 похожих уязвимости
+                for vuln, similarity in sorted_vulnerabilities[:3]:
+                    vuln_name = vuln.get("Name", "Не указано")
+                    vuln_description = vuln.get("Description", "Нет описания")
+                    vuln_cvss = vuln.get("CVSS2", "")
+                    results_list.append(f"  -> Уязвимость: {vuln_name}: {vuln_description} (CVSS2: {vuln_cvss}), Схожесть: {similarity:.4f}\n")
+
+        except FileNotFoundError:
+            general_output.value = "Ошибка: Один или оба файла не найдены."
+        except json.JSONDecodeError:
+            general_output.value = "Ошибка: Некорректный формат JSON в одном из файлов."
+        except Exception as e:
+            general_output.value = f"Произошла ошибка: {e}"
+
+        results_text.controls.clear()
+        for res in results_list:
+            results_text.controls.append(Text(value=res))
+        general_output.value = "Результаты анализа получены."
+        show_snack_bar("Результаты успешно получены.")
+
+        update_ui()
+
     globals()["get_data_path"] = get_data_path
     globals()["get_stopwords_path"] = get_stopwords_path
     globals()["file_dropdown_changed"] = file_dropdown_changed
@@ -703,12 +866,19 @@ def main(page_: ft.Page):
     globals()["selected_format"] = selected_format  # Добавлено чтобы не было ошибки
     globals()["results_save_file_picker"] = results_save_file_picker
     globals()["model_save_file_picker"] = model_save_file_picker
+    globals()["pick_threat_file"] = pick_threat_file
+    globals()["pick_vulnerability_file"] = pick_vulnerability_file
+    globals()["show_threat_vulnerability_results_clicked"] = compare_threats_vulnerabilities_clicked
+    globals()["get_threat_file_path"] = get_threat_file_path
+    globals()["get_vulnerability_file_path"] = get_vulnerability_file_path
 
     data_file_picker = FilePicker(on_result=get_data_path)
     stopwords_file_picker = FilePicker(on_result=get_stopwords_path)
     results_save_file_picker = FilePicker(on_result=get_results_save_path) #FilePicker для сохранения результатов
     model_save_file_picker = FilePicker(on_result=get_model_save_path) #FilePicker для сохранения модели
     model_file_picker = FilePicker(on_result=get_model_path)
+    threat_file_picker = FilePicker(on_result=get_threat_file_path)
+    vulnerability_file_picker = FilePicker(on_result=get_vulnerability_file_path)
 
     file_dropdown = Dropdown(
         options=[],
@@ -749,7 +919,10 @@ def main(page_: ft.Page):
     save_model_button = ElevatedButton(
         "Сохранить модель", on_click=save_model_button_clicked
     )  # Кнопка "Сохранить модель"
-    yrg_val_srav_button = ElevatedButton("Сравнение Угроз и уязвимостей")
+    pick_threat_button = ElevatedButton("Выбрать файл угроз", on_click=pick_threat_file)
+    pick_vulnerability_button = ElevatedButton("Выбрать файл уязвимостей", on_click=pick_vulnerability_file)
+    compare_button = ElevatedButton("Найти уязвимости для угроз", on_click=compare_threats_vulnerabilities_clicked)
+
     # Инициализируем general_output перед использованием
     general_output = Text("")
 
@@ -764,13 +937,16 @@ def main(page_: ft.Page):
     page.overlay.append(results_save_file_picker) #Добавлены FilePicker
     page.overlay.append(model_save_file_picker) #Добавлены FilePicker
     page.overlay.append(model_file_picker)
+    page.overlay.append(threat_file_picker)
+    page.overlay.append(vulnerability_file_picker)
 
     page.add(
         ft.Row(
             [data_button, stopwords_button], alignment=ft.MainAxisAlignment.CENTER
         ),
         ft.Row([train_button, model_button], alignment=ft.MainAxisAlignment.CENTER),
-        ft.Row([yrg_val_srav_button], alignment=ft.MainAxisAlignment.CENTER),  # Added Button to compare Risk and Vulnerability
+        ft.Row([pick_threat_button, pick_vulnerability_button], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Row([compare_button], alignment=ft.MainAxisAlignment.CENTER), # Added Button to compare Risk and Vulnerability
         ft.Row(
             [show_results_button, save_results_button],
             alignment=ft.MainAxisAlignment.CENTER,
