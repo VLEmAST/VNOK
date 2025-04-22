@@ -1,0 +1,779 @@
+import sys
+import os
+import json
+import numpy as np
+import pymorphy3
+import re
+import string
+import fasttext
+from sklearn.metrics.pairwise import cosine_similarity
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QFileDialog, QTextEdit,
+    QMessageBox, QProgressBar, QGroupBox
+)
+from PyQt6.QtGui import QFont, QColor, QPalette
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer, Qt
+
+# Инициализация анализатора
+morph = pymorphy3.MorphAnalyzer()
+
+class StyledProgressBar(QProgressBar):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #3A3939;
+                border-radius: 5px;
+                text-align: center;
+                background: #F0F0F0;
+                height: 20px;
+                color: black;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #5BC0DE, stop:0.5 #428BCA, stop:1 #2C3E50);
+                border-radius: 3px;
+            }
+        """)
+        self.setFormat("%p% (%v из %m)")
+        self.setTextVisible(True)
+
+class Worker(QObject):
+    finished = pyqtSignal()
+    progress = pyqtSignal(int, str)
+    message = pyqtSignal(str)
+    data_loaded = pyqtSignal(str, bool)
+    model_loaded = pyqtSignal(bool)
+    validation_complete = pyqtSignal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self.stop_words = set()
+        self.model = None
+        self.is_working = False
+        self.should_stop = False
+        self.vulnerabilities_data = []
+        self.threats_data = []
+        self.punctuation_regex = re.compile(f"[{re.escape(string.punctuation)}]")
+
+    def clean_text(self, text):
+        """Очистка текста от символов новой строки и лишних пробелов"""
+        if not isinstance(text, str):
+            text = str(text)
+        return ' '.join(text.replace('\n', ' ').replace('\r', ' ').split())
+
+    def _check_criteria(self, threat, vuln):
+        """Проверка соответствия критериев CVSS между угрозой и уязвимостью"""
+        # Получаем CVSS вектор из уязвимости
+        cvss_vector = vuln.get("CVSS_2_0", "")
+        
+        # Если CVSS вектор не указан, пропускаем проверку
+        if not cvss_vector:
+            return True
+        
+        # Парсим CVSS вектор
+        cvss_parts = {}
+        for part in cvss_vector.split('/'):
+            key, value = part.split(':')
+            cvss_parts[key] = value
+        
+        # Получаем параметры угрозы
+        privacy = threat.get("PrivacyViolation", "0")
+        integrity = threat.get("IntegrityViolation", "0")
+        availability = threat.get("AccessibilityViolation", "0")
+        
+        # Проверяем соответствие параметров
+        privacy_match = (privacy == "1" and "C" in cvss_parts and 
+                        cvss_parts["C"] in ["C", "P"]) or \
+                       (privacy == "0" and ("C" not in cvss_parts or 
+                        cvss_parts["C"] == "N"))
+        
+        integrity_match = (integrity == "1" and "I" in cvss_parts and 
+                          cvss_parts["I"] in ["C", "P"]) or \
+                         (integrity == "0" and ("I" not in cvss_parts or 
+                          cvss_parts["I"] == "N"))
+        
+        availability_match = (availability == "1" and "A" in cvss_parts and 
+                             cvss_parts["A"] in ["C", "P"]) or \
+                            (availability == "0" and ("A" not in cvss_parts or 
+                             cvss_parts["A"] == "N"))
+        
+        return privacy_match and integrity_match and availability_match
+
+    def load_stopwords(self, filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                self.stop_words = set(json.load(f))
+            self.message.emit(f"Успешно загружены стоп-слова из {filepath}")
+            return True
+        except Exception as e:
+            self.message.emit(f"Ошибка загрузки стоп-слов: {str(e)}")
+            return False
+
+    def load_model(self, filepath):
+        try:
+            self.progress.emit(10, "Проверка файла модели...")
+            
+            if not os.path.exists(filepath):
+                raise FileNotFoundError(f"Файл не найден: {filepath}")
+                
+            if not filepath.lower().endswith('.bin'):
+                raise ValueError("Файл модели должен иметь расширение .bin")
+                
+            file_size = os.path.getsize(filepath) / (1024 * 1024)
+            if file_size < 1:
+                raise ValueError(f"Файл модели слишком мал ({file_size:.2f} MB), возможно поврежден")
+                
+            self.progress.emit(30, "Загрузка модели...")
+            
+            self.model = fasttext.load_model(filepath)
+            
+            if not hasattr(self.model, 'get_sentence_vector'):
+                raise AttributeError("Загруженный файл не содержит модель FastText")
+                
+            self.progress.emit(100, "Модель загружена")
+            self.model_loaded.emit(True)
+            
+        except Exception as e:
+            self.message.emit(f"Ошибка загрузки модели: {str(e)}")
+            self.model_loaded.emit(False)
+        finally:
+            self.finished.emit()
+    
+    def load_vulnerabilities(self, filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if not isinstance(data, list):
+                    data = [data]
+            
+            for vuln in data:
+                if 'vulnerability_name' in vuln:
+                    vuln['vulnerability_name'] = self.clean_text(vuln['vulnerability_name'])
+                if 'vulnerability_description' in vuln:
+                    vuln['vulnerability_description'] = self.clean_text(vuln['vulnerability_description'])
+                if 'related_threat_id' not in vuln:
+                    vuln['related_threat_id'] = None
+                if 'threat_score' not in vuln:
+                    vuln['threat_score'] = ""
+                if 'CVSS_2_0' not in vuln:
+                    vuln['CVSS_2_0'] = ""
+            
+            self.vulnerabilities_data = data
+            self.message.emit(f"Успешно загружены уязвимости из {filepath}")
+            self.data_loaded.emit("vulnerabilities", True)
+            return True
+        except Exception as e:
+            self.message.emit(f"Ошибка загрузки уязвимостей: {str(e)}")
+            self.data_loaded.emit("vulnerabilities", False)
+            return False
+
+    def load_threats(self, filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if not isinstance(data, list):
+                    data = [data]
+            
+            for i, threat in enumerate(data):
+                if 'Name' in threat:
+                    threat['Name'] = self.clean_text(threat['Name'])
+                if 'Description' in threat:
+                    threat['Description'] = self.clean_text(threat['Description'])
+                if 'Id' not in threat:
+                    threat['Id'] = str(i)
+                if 'IdentifierUBI' not in threat:
+                    threat['IdentifierUBI'] = ""
+                if 'PrivacyViolation' not in threat:
+                    threat['PrivacyViolation'] = "0"
+                if 'IntegrityViolation' not in threat:
+                    threat['IntegrityViolation'] = "0"
+                if 'AccessibilityViolation' not in threat:
+                    threat['AccessibilityViolation'] = "0"
+            
+            self.threats_data = data
+            self.message.emit(f"Успешно загружены угрозы из {filepath}")
+            self.data_loaded.emit("threats", True)
+            return True
+        except Exception as e:
+            self.message.emit(f"Ошибка загрузки угроз: {str(e)}")
+            self.data_loaded.emit("threats", False)
+            return False
+
+    def validate_matching(self):
+        try:
+            results = {
+                'total': len(self.vulnerabilities_data),
+                'correct': 0,
+                'incorrect': 0,
+                'details': [],
+                'accuracy': 0.0
+            }
+            
+            self.progress.emit(10, "Подготовка данных...")
+            
+            # Подготовка векторов угроз (только Description)
+            threat_objects = []
+            threat_vectors = []
+            
+            for threat in self.threats_data:
+                threat_text = threat.get('Description', '')  # Только поле Description
+                threat_text = self.clean_text(threat_text)
+                threat_vectors.append(self.model.get_sentence_vector(threat_text))
+                threat_objects.append(threat)
+            
+            threat_matrix = np.array(threat_vectors)
+            
+            # Обработка каждой уязвимости
+            for i, vuln in enumerate(self.vulnerabilities_data):
+                if self.should_stop:
+                    break
+                    
+                progress = 30 + int(i / len(self.vulnerabilities_data) * 70)
+                self.progress.emit(progress, f"Анализ уязвимости {i+1}/{len(self.vulnerabilities_data)}...")
+                
+                vuln_text = vuln.get('vulnerability_description', '')  # Только поле vulnerability_description
+                vuln_text = self.clean_text(vuln_text)
+                vuln_vector = self.model.get_sentence_vector(vuln_text).reshape(1, -1)
+                
+                # 1. Фильтрация по CVSS
+                filtered_indices = [
+                    i for i, threat in enumerate(threat_objects) 
+                    if self._check_criteria(threat, vuln)
+                ]
+                
+                # 2. Косинусное сходство с отфильтрованными угрозами
+                if filtered_indices:
+                    filtered_matrix = threat_matrix[filtered_indices]
+                    similarities = cosine_similarity(vuln_vector, filtered_matrix).flatten()
+                    best_idx = filtered_indices[np.argmax(similarities)]
+                    max_similarity = similarities.max()
+                    cvss_filtered = True
+                else:
+                    similarities = cosine_similarity(vuln_vector, threat_matrix).flatten()
+                    best_idx = np.argmax(similarities)
+                    max_similarity = similarities.max()
+                    cvss_filtered = False
+                
+                best_threat = threat_objects[best_idx]
+                
+                # 3. Проверка совпадения идентификаторов
+                is_correct = (str(vuln.get('threat_score', '')) == 
+                             str(best_threat.get('IdentifierUBI', '')))
+                
+                if is_correct:
+                    results['correct'] += 1
+                else:
+                    results['incorrect'] += 1
+                
+                # Сохранение деталей
+                results['details'].append({
+                    'vulnerability_id': vuln.get('id', ''),
+                    'vulnerability_name': vuln.get('vulnerability_name', ''),
+                    'vulnerability_description': vuln_text,
+                    'threat_score': vuln.get('threat_score', ''),
+                    'predicted_threat': best_threat.get('Id', ''),
+                    'predicted_threat_name': best_threat.get('Name', ''),
+                    'predicted_threat_description': best_threat.get('Description', ''),
+                    'threat_identifier': best_threat.get('IdentifierUBI', ''),
+                    'similarity': float(max_similarity),
+                    'cvss_filtered': cvss_filtered,
+                    'identifier_match': is_correct,
+                    'correct': is_correct
+                })
+            
+            results['accuracy'] = results['correct'] / results['total'] * 100
+            self.validation_complete.emit(results)
+            
+        except Exception as e:
+            self.message.emit(f"Ошибка при валидации: {str(e)}")
+            self.validation_complete.emit({
+                'error': str(e),
+                'total': 0,
+                'correct': 0,
+                'incorrect': 0,
+                'details': [],
+                'accuracy': 0.0
+            })
+        finally:
+            self.finished.emit()
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Анализатор соответствия уязвимостей и угроз")
+        self.setGeometry(100, 100, 1000, 800)
+        
+        # Светлая палитра с чёрным текстом
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(240, 240, 240))
+        palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.black)
+        palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
+        palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.black)
+        palette.setColor(QPalette.ColorRole.Button, QColor(240, 240, 240))
+        palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
+        self.setPalette(palette)
+        
+        self.worker = Worker()
+        self.worker_thread = QThread()
+        self.worker.moveToThread(self.worker_thread)
+        
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.message.connect(self.update_status)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.data_loaded.connect(self.handle_data_loaded)
+        self.worker.model_loaded.connect(self.handle_model_loaded)
+        self.worker.validation_complete.connect(self.show_validation_results)
+        
+        self.worker_thread.start()
+        
+        self.responsiveness_timer = QTimer()
+        self.responsiveness_timer.timeout.connect(lambda: QApplication.processEvents())
+        self.responsiveness_timer.start(100)
+        
+        self.init_ui()
+        
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QVBoxLayout()
+        central_widget.setLayout(main_layout)
+        
+        # Группа загрузки данных
+        load_group = QGroupBox("Загрузка данных")
+        load_group.setStyleSheet("""
+            QGroupBox {
+                font: bold 12px;
+                border: 1px solid #3A3939;
+                border-radius: 5px;
+                margin-top: 10px;
+                color: black;
+                background-color: #F0F0F0;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 3px;
+                color: black;
+            }
+        """)
+        load_layout = QVBoxLayout()
+        load_group.setLayout(load_layout)
+        
+        file_buttons_layout = QHBoxLayout()
+        
+        self.load_vuln_btn = QPushButton("Загрузить уязвимости")
+        self.load_vuln_btn.setStyleSheet("""
+            QPushButton {
+                background: #5BC0DE;
+                border: 1px solid #3A3939;
+                border-radius: 5px;
+                padding: 5px;
+                min-width: 120px;
+                color: black;
+            }
+            QPushButton:hover {
+                background: #428BCA;
+            }
+            QPushButton:disabled {
+                background: #CCCCCC;
+            }
+        """)
+        self.load_vuln_btn.clicked.connect(self.load_vulnerabilities)
+        
+        self.load_threats_btn = QPushButton("Загрузить угрозы")
+        self.load_threats_btn.setStyleSheet("""
+            QPushButton {
+                background: #5BC0DE;
+                border: 1px solid #3A3939;
+                border-radius: 5px;
+                padding: 5px;
+                min-width: 120px;
+                color: black;
+            }
+            QPushButton:hover {
+                background: #428BCA;
+            }
+            QPushButton:disabled {
+                background: #CCCCCC;
+            }
+        """)
+        self.load_threats_btn.clicked.connect(self.load_threats)
+        
+        self.load_stopwords_btn = QPushButton("Загрузить стоп-слова")
+        self.load_stopwords_btn.setStyleSheet("""
+            QPushButton {
+                background: #5BC0DE;
+                border: 1px solid #3A3939;
+                border-radius: 5px;
+                padding: 5px;
+                min-width: 120px;
+                color: black;
+            }
+            QPushButton:hover {
+                background: #428BCA;
+            }
+            QPushButton:disabled {
+                background: #CCCCCC;
+            }
+        """)
+        self.load_stopwords_btn.clicked.connect(self.load_stopwords)
+        
+        self.load_model_btn = QPushButton("Загрузить модель (.bin)")
+        self.load_model_btn.setStyleSheet("""
+            QPushButton {
+                background: #5BC0DE;
+                border: 1px solid #3A3939;
+                border-radius: 5px;
+                padding: 5px;
+                min-width: 120px;
+                color: black;
+            }
+            QPushButton:hover {
+                background: #428BCA;
+            }
+            QPushButton:disabled {
+                background: #CCCCCC;
+            }
+        """)
+        self.load_model_btn.clicked.connect(self.load_model_file)
+        
+        file_buttons_layout.addWidget(self.load_vuln_btn)
+        file_buttons_layout.addWidget(self.load_threats_btn)
+        file_buttons_layout.addWidget(self.load_stopwords_btn)
+        file_buttons_layout.addWidget(self.load_model_btn)
+        load_layout.addLayout(file_buttons_layout)
+        
+        self.load_status_vuln = QLabel("Файл уязвимостей: не загружен")
+        self.load_status_threats = QLabel("Файл угроз: не загружен")
+        self.load_status_stopwords = QLabel("Стоп-слова: не загружены")
+        self.load_status_model = QLabel("Модель FastText: не загружена")
+        
+        load_layout.addWidget(self.load_status_vuln)
+        load_layout.addWidget(self.load_status_threats)
+        load_layout.addWidget(self.load_status_stopwords)
+        load_layout.addWidget(self.load_status_model)
+        
+        self.main_progress = StyledProgressBar()
+        self.main_progress.setVisible(False)
+        load_layout.addWidget(self.main_progress)
+        
+        main_layout.addWidget(load_group)
+        
+        # Группа валидации
+        validation_group = QGroupBox("Проверка соответствия")
+        validation_group.setStyleSheet(load_group.styleSheet())
+        validation_layout = QVBoxLayout()
+        validation_group.setLayout(validation_layout)
+        
+        self.validate_btn = QPushButton("Проверить соответствия")
+        self.validate_btn.setStyleSheet("""
+            QPushButton {
+                background: #5CB85C;
+                border: 1px solid #3A3939;
+                border-radius: 5px;
+                padding: 8px;
+                font: bold 12px;
+                min-width: 200px;
+                color: black;
+            }
+            QPushButton:hover {
+                background: #449D44;
+            }
+            QPushButton:disabled {
+                background: #CCCCCC;
+            }
+        """)
+        self.validate_btn.clicked.connect(self.validate_matching)
+        self.validate_btn.setEnabled(False)
+        validation_layout.addWidget(self.validate_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        
+        self.validation_progress = StyledProgressBar()
+        self.validation_progress.setVisible(False)
+        validation_layout.addWidget(self.validation_progress)
+        
+        self.validation_status = QLabel()
+        self.validation_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        validation_layout.addWidget(self.validation_status)
+        
+        main_layout.addWidget(validation_group)
+        
+        # Группа результатов
+        results_group = QGroupBox("Результаты")
+        results_group.setStyleSheet(load_group.styleSheet())
+        results_layout = QVBoxLayout()
+        results_group.setLayout(results_layout)
+        
+        self.results_output = QTextEdit()
+        self.results_output.setStyleSheet("""
+            QTextEdit {
+                border: 1px solid #3A3939;
+                border-radius: 5px;
+                padding: 5px;
+                background: white;
+                color: black;
+            }
+        """)
+        self.results_output.setReadOnly(True)
+        results_layout.addWidget(self.results_output)
+        
+        main_layout.addWidget(results_group)
+        
+        # Статусная строка
+        self.status_bar = QLabel("Готов к работе")
+        self.status_bar.setStyleSheet("""
+            QLabel {
+                border-top: 1px solid #3A3939;
+                padding: 5px;
+                background: #F8F8F8;
+                color: black;
+            }
+        """)
+        main_layout.addWidget(self.status_bar)
+        
+        self.current_results = None
+
+    def load_model_file(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл модели FastText", "", "FastText Model (*.bin)"
+        )
+        
+        if filepath:
+            self.worker.model = None
+            self.main_progress.setVisible(True)
+            self.main_progress.setValue(0)
+            self.load_status_model.setText("Модель FastText: загрузка...")
+            self.load_status_model.setStyleSheet("color: black")
+            self.start_operation()
+            
+            try:
+                self.worker.model_loaded.disconnect()
+            except:
+                pass
+                
+            self.worker.model_loaded.connect(self.handle_model_loaded)
+            self.worker.progress.connect(self.update_model_progress)
+            self.worker.load_model(filepath)
+
+    def update_model_progress(self, value, message=None):
+        self.main_progress.setValue(value)
+        if message:
+            self.load_status_model.setText(f"Модель FastText: {message}")
+            self.status_bar.setText(message)
+
+    def handle_model_loaded(self, success):
+        self.main_progress.setVisible(False)
+        self.end_operation()
+        
+        if success:
+            self.load_status_model.setText("Модель FastText: успешно загружена")
+            self.load_status_model.setStyleSheet("color: black")
+            self.update_status("Модель FastText успешно загружена")
+            
+            if hasattr(self.worker, 'model') and self.worker.model is not None:
+                try:
+                    test_vector = self.worker.model.get_sentence_vector("тест")
+                    self.update_status(f"Модель готова (размер вектора: {len(test_vector)})")
+                except Exception as e:
+                    self.load_status_model.setText("Модель FastText: ошибка проверки")
+                    self.load_status_model.setStyleSheet("color: black")
+                    self.update_status(f"Ошибка проверки модели: {str(e)}")
+        else:
+            self.load_status_model.setText("Модель FastText: ошибка загрузки")
+            self.load_status_model.setStyleSheet("color: black")
+            self.update_status("Ошибка загрузки модели FastText")
+        
+        self.update_validate_button_state()
+
+    def load_vulnerabilities(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл с уязвимостями", "", "JSON Files (*.json)"
+        )
+        
+        if filepath:
+            self.main_progress.setVisible(True)
+            self.main_progress.setValue(0)
+            self.load_status_vuln.setText("Файл уязвимостей: загрузка...")
+            self.load_status_vuln.setStyleSheet("color: black")
+            self.worker.load_vulnerabilities(filepath)
+
+    def load_threats(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл с угрозами", "", "JSON Files (*.json)"
+        )
+        
+        if filepath:
+            self.main_progress.setVisible(True)
+            self.main_progress.setValue(0)
+            self.load_status_threats.setText("Файл угроз: загрузка...")
+            self.load_status_threats.setStyleSheet("color: black")
+            self.worker.load_threats(filepath)
+
+    def load_stopwords(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл со стоп-словами", "", "JSON Files (*.json)"
+        )
+        
+        if filepath:
+            self.main_progress.setVisible(True)
+            self.main_progress.setValue(0)
+            self.load_status_stopwords.setText("Стоп-слова: загрузка...")
+            self.load_status_stopwords.setStyleSheet("color: black")
+            self.worker.load_stopwords(filepath)
+
+    def validate_matching(self):
+        if not hasattr(self.worker, 'vulnerabilities_data') or not self.worker.vulnerabilities_data:
+            QMessageBox.warning(self, "Ошибка", "Сначала загрузите файл с уязвимостями")
+            return
+            
+        if not hasattr(self.worker, 'threats_data') or not self.worker.threats_data:
+            QMessageBox.warning(self, "Ошибка", "Сначала загрузите файл с угрозами")
+            return
+            
+        if not hasattr(self.worker, 'model') or not self.worker.model:
+            QMessageBox.warning(self, "Ошибка", "Сначала загрузите модель FastText")
+            return
+            
+        self.validation_progress.setVisible(True)
+        self.validation_progress.setValue(0)
+        self.validation_status.setText("Начало анализа...")
+        self.worker.validate_matching()
+
+    def handle_data_loaded(self, data_type, success):
+        self.main_progress.setValue(100)
+        self.main_progress.setVisible(False)
+        
+        if data_type == "vulnerabilities":
+            if success:
+                self.load_status_vuln.setText(f"Файл уязвимостей: успешно загружен ({len(self.worker.vulnerabilities_data)} записей)")
+                self.load_status_vuln.setStyleSheet("color: black")
+            else:
+                self.load_status_vuln.setText("Файл уязвимостей: ошибка загрузки")
+                self.load_status_vuln.setStyleSheet("color: black")
+        
+        elif data_type == "threats":
+            if success:
+                self.load_status_threats.setText(f"Файл угроз: успешно загружен ({len(self.worker.threats_data)} записей)")
+                self.load_status_threats.setStyleSheet("color: black")
+            else:
+                self.load_status_threats.setText("Файл угроз: ошибка загрузки")
+                self.load_status_threats.setStyleSheet("color: black")
+        
+        elif data_type == "stopwords":
+            if success:
+                self.load_status_stopwords.setText(f"Стоп-слова: успешно загружены ({len(self.worker.stop_words)} слов)")
+                self.load_status_stopwords.setStyleSheet("color: black")
+            else:
+                self.load_status_stopwords.setText("Стоп-слова: ошибка загрузки")
+                self.load_status_stopwords.setStyleSheet("color: black")
+        
+        self.update_validate_button_state()
+        
+        if success:
+            self.update_status(f"Успешно загружены {data_type}")
+        else:
+            self.update_status(f"Ошибка загрузки {data_type}")
+
+    def update_progress(self, value, status_text=None):
+        if self.validation_progress.isVisible():
+            self.validation_progress.setValue(value)
+            if status_text:
+                self.validation_status.setText(status_text)
+        
+        if status_text:
+            self.update_status(status_text)
+
+    def update_validate_button_state(self):
+        has_data = len(self.worker.vulnerabilities_data) > 0 and len(self.worker.threats_data) > 0
+        has_model = self.worker.model is not None
+        self.validate_btn.setEnabled(has_data and has_model)
+
+    def show_validation_results(self, results):
+        self.validation_progress.setValue(100)
+        self.validation_progress.setVisible(False)
+        self.validation_status.setText("Анализ завершен!")
+        
+        if 'error' in results:
+            self.results_output.clear()
+            self.results_output.append(f"<span style='color:black;'>Ошибка: {results['error']}</span>")
+            return
+            
+        self.current_results = results
+        self.results_output.clear()
+        
+        # Вывод общей статистики
+        self.results_output.append("<h3 style='color:black;'>=== ОБЩИЕ РЕЗУЛЬТАТЫ ===</h3>")
+        self.results_output.append(f"<b>Всего проверено:</b> {results['total']}")
+        self.results_output.append(f"<b>Правильных соответствий:</b> {results['correct']}")
+        self.results_output.append(f"<b>Неправильных соответствий:</b> {results['incorrect']}")
+        self.results_output.append(f"<b>Точность:</b> {results['accuracy']:.2f}%")
+        self.results_output.append("<br>")
+        
+        # Вывод деталей
+        self.results_output.append("<h3 style='color:black;'>=== ДЕТАЛИ ПРОВЕРКИ ===</h3>")
+        for detail in results['details']:
+            status = "✓ СОВПАЛО" if detail['correct'] else "✗ НЕ СОВПАЛО"
+            cvss_status = "✓ ПРОШЛА" if detail['cvss_filtered'] else "✗ НЕ ПРОШЛА"
+            id_status = "✓ СОВПАДАЕТ" if detail['identifier_match'] else "✗ НЕ СОВПАДАЕТ"
+            
+            self.results_output.append(
+                f"<b>Уязвимость ID:</b> {detail['vulnerability_id']}<br>"
+                f"<b>Название:</b> {detail['vulnerability_name']}<br>"
+                f"<b>Описание уязвимости:</b> {detail['vulnerability_description']}<br>"
+                f"<b>Threat score:</b> {detail['threat_score']}<br>"
+                f"<b>Фильтрация CVSS:</b> {cvss_status}<br>"
+                f"<b>Найдена угроза ID:</b> {detail['predicted_threat']}<br>"
+                f"<b>Название угрозы:</b> {detail['predicted_threat_name']}<br>"
+                f"<b>Описание угрозы:</b> {detail['predicted_threat_description']}<br>"
+                f"<b>IdentifierUBI угрозы:</b> {detail['threat_identifier']}<br>"
+                f"<b>Сходство текста:</b> {detail['similarity']:.4f}<br>"
+                f"<b>Совпадение идентификаторов:</b> {id_status}<br>"
+                f"<b>Результат:</b> {status}<hr>"
+            )
+        
+        QMessageBox.information(
+            self, "Результаты проверки",
+            f"Проверено: {results['total']}\n"
+            f"Совпадений: {results['correct']}\n"
+            f"Точность: {results['accuracy']:.1f}%"
+        )
+
+    def update_status(self, message):
+        self.status_bar.setText(message)
+
+    def start_operation(self):
+        self.set_buttons_enabled(False)
+        self.responsiveness_timer.start(100)
+        
+    def end_operation(self):
+        self.set_buttons_enabled(True)
+        self.responsiveness_timer.stop()
+        
+    def set_buttons_enabled(self, enabled):
+        self.load_vuln_btn.setEnabled(enabled)
+        self.load_threats_btn.setEnabled(enabled)
+        self.load_stopwords_btn.setEnabled(enabled)
+        self.load_model_btn.setEnabled(enabled)
+        self.validate_btn.setEnabled(enabled and self.worker.model is not None 
+                                   and len(self.worker.vulnerabilities_data) > 0 
+                                   and len(self.worker.threats_data) > 0)
+
+    def closeEvent(self, event):
+        self.worker.should_stop = True
+        self.worker_thread.quit()
+        event.accept()
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    
+    font = QFont()
+    font.setFamily("Segoe UI")
+    font.setPointSize(10)
+    app.setFont(font)
+    
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
