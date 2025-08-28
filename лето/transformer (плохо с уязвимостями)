@@ -1,0 +1,771 @@
+import sys
+import mmap
+import pickle
+import string
+import numpy as np
+import pandas as pd
+import orjson
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from functools import lru_cache
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
+    QVBoxLayout, QHBoxLayout, QFileDialog, QComboBox, QTextEdit,
+    QMessageBox, QProgressBar, QGroupBox
+)
+from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt, QTimer
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+
+class CompareWorker(QObject):
+    progress = pyqtSignal(int)
+    results_ready = pyqtSignal(list)
+    finished = pyqtSignal()
+
+    def __init__(self, threat_data, vulnerability_data, reference_text, model):
+        super().__init__()
+        self.threat_data = threat_data
+        self.vulnerability_data = vulnerability_data
+        self.reference_text = reference_text
+        self.model = model
+        self.should_stop = False
+        self.punctuation_translator = str.maketrans("", "", string.punctuation)
+
+    def preprocess_text(self, text):
+        if not isinstance(text, str):
+            return ""
+        text = text.translate(self.punctuation_translator)
+        return text
+
+    def process(self):
+        try:
+            self.progress.emit(20)
+            
+            target_desc = self.preprocess_text(self.reference_text)
+            target_vector = self.model.encode(target_desc).reshape(1, -1)
+            
+            self.progress.emit(30)
+
+            threat_texts = [self.preprocess_text(f"{item.get('Name', '')} {item.get('Description', '')}") for item in self.threat_data]
+            threat_vectors = self.model.encode(threat_texts, batch_size=32, show_progress_bar=False)
+            threat_matrix = np.array(threat_vectors)
+            similarities = cosine_similarity(target_vector, threat_matrix).flatten()
+            top_threat_indices = np.argsort(similarities)[-5:][::-1]
+            top_threats = [(self.threat_data[i], similarities[i]) for i in top_threat_indices]
+
+            self.progress.emit(70)
+
+            results = []
+            for threat, similarity in top_threats:
+                if self.should_stop:
+                    break
+                    
+                QApplication.processEvents()
+                
+                results.append(
+                    f"Угроза: {threat.get('Name', '')}\n"
+                    f"Описание: {threat.get('Description', '')}\n"
+                    f"Нарушение конфиденциальности: {threat.get('PrivacyViolation', '0')}\n"
+                    f"Нарушение целостности: {threat.get('IntegrityViolation', '0')}\n"
+                    f"Нарушение доступности: {threat.get('AccessibilityViolation', '0')}\n"
+                    f"Сходство: {similarity:.4f}\n"
+                )
+
+                filtered_vulns = [
+                    vuln for vuln in self.vulnerability_data
+                    if self._check_criteria(threat, vuln)
+                ]
+                
+                if filtered_vulns and not self.should_stop:
+                    vuln_texts = [self.preprocess_text(f"{vuln.get('Name', '')} {vuln.get('Description', '')}") for vuln in filtered_vulns]
+                    vuln_vectors = self.model.encode(vuln_texts, batch_size=32, show_progress_bar=False)
+                    vuln_matrix = np.array(vuln_vectors)
+                    threat_text = self.preprocess_text(f"{threat.get('Name', '')} {threat.get('Description', '')}")
+                    threat_vector = self.model.encode(threat_text).reshape(1, -1)
+                    vuln_similarities = cosine_similarity(threat_vector, vuln_matrix).flatten()
+                    top_vuln_indices = np.argsort(vuln_similarities)[-3:][::-1]
+
+                    for i, idx in enumerate(top_vuln_indices, 1):
+                        if self.should_stop:
+                            break
+                        
+                        QApplication.processEvents()
+                        
+                        vuln = filtered_vulns[idx]
+                        results.append(
+                            f"  Уязвимость #{i}:\n"
+                            f"    Название: {vuln.get('Name', '')}\n"
+                            f"    Описание: {vuln.get('Description', '')}\n"
+                            f"    CVSS2: {vuln.get('CVSS2', '')}\n"
+                            f"    Сходство с угрозой: {vuln_similarities[idx]:.4f}\n"
+                        )
+
+            if not self.should_stop:
+                self.progress.emit(100)
+                self.results_ready.emit(results)
+
+        except Exception as e:
+            self.results_ready.emit([f"Ошибка: {str(e)}"])
+        finally:
+            self.finished.emit()
+
+    def _check_criteria(self, threat, vuln):
+        privacy = threat.get("PrivacyViolation", "0")
+        integrity = threat.get("IntegrityViolation", "0")
+        availability = threat.get("AccessibilityViolation", "0")
+        vuln_cvss = vuln.get("CVSS2", "")
+        
+        privacy_match = (privacy == "1" and "C:C" in vuln_cvss) or (privacy == "0" and "C:C" not in vuln_cvss)
+        integrity_match = (integrity == "1" and "I:C" in vuln_cvss) or (integrity == "0" and "I:C" not in vuln_cvss)
+        availability_match = (availability == "1" and "A:C" in vuln_cvss) or (availability == "0" and "A:C" not in vuln_cvss)
+        
+        return privacy_match and integrity_match and availability_match
+
+class Worker(QObject):
+    finished = pyqtSignal()
+    progress = pyqtSignal(int)
+    message = pyqtSignal(str)
+    data_loaded = pyqtSignal(bool)
+    results_ready = pyqtSignal(list)
+    model_loaded = pyqtSignal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.loaded_files = []
+        self.model = None
+        self.punctuation_translator = str.maketrans("", "", string.punctuation)
+        self.is_working = False
+        self.should_stop = False
+
+    def preprocess_text(self, text):
+        if not isinstance(text, str):
+            return ""
+        text = text.translate(self.punctuation_translator)
+        return text
+
+    def load_data_from_files(self, filepaths):
+        if self.is_working:
+            self.message.emit("Операция уже выполняется")
+            return
+
+        self.is_working = True
+        self.should_stop = False
+        try:
+            QApplication.processEvents()
+            
+            self.loaded_files = filepaths
+            
+            self.progress.emit(100)
+            self.data_loaded.emit(True)
+                
+        except Exception as e:
+            self.message.emit(f"Критическая ошибка: {str(e)}")
+            self.data_loaded.emit(False)
+        finally:
+            self.is_working = False
+            self.finished.emit()
+
+    def load_model(self, filepath):
+        if self.is_working:
+            self.message.emit("Операция уже выполняется")
+            return
+
+        self.is_working = True
+        self.should_stop = False
+        try:
+            QApplication.processEvents()
+            
+            self.model = SentenceTransformer(filepath)
+            self.message.emit(f"Модель загружена из {os.path.basename(filepath)}")
+            self.model_loaded.emit(True)
+        except Exception as e:
+            self.message.emit(f"Ошибка при загрузке модели: {str(e)}")
+            self.model_loaded.emit(False)
+        finally:
+            self.is_working = False
+            self.finished.emit()
+
+    def save_model_to_file(self, filepath):
+        if self.is_working:
+            self.message.emit("Операция уже выполняется")
+            return False
+
+        self.is_working = True
+        try:
+            QApplication.processEvents()
+            
+            if not self.model:
+                self.message.emit("Нет модели для сохранения")
+                return False
+            
+            self.model.save(filepath)
+            self.message.emit(f"Модель сохранена в {filepath}")
+            return True
+        except Exception as e:
+            self.message.emit(f"Ошибка при сохранении модели: {str(e)}")
+            return False
+        finally:
+            self.is_working = False
+
+    def find_most_similar(self, reference_text, file_index, top_n=3):
+        if self.is_working:
+            self.message.emit("Операция уже выполняется")
+            return
+
+        self.is_working = True
+        self.should_stop = False
+        try:
+            QApplication.processEvents()
+            self.message.emit("Анализ текста...")
+            self.progress.emit(10)
+            
+            filename = os.path.basename(self.loaded_files[file_index])
+            
+            with open(self.loaded_files[file_index], "rb") as f:
+                analysis_data = orjson.loads(f.read())
+                if not isinstance(analysis_data, list):
+                    analysis_data = [analysis_data]
+
+            self.progress.emit(30)
+            
+            if self.should_stop:
+                return
+                
+            target_desc = self.preprocess_text(reference_text)
+            target_vector = self.model.encode(target_desc).reshape(1, -1)
+
+            has_techniques = any(
+                "Techniques" in item and isinstance(item["Techniques"], list)
+                for item in analysis_data
+                if isinstance(item, dict)
+            )
+
+            if has_techniques:
+                tactics_techniques = []
+                tactics_info = {}
+                
+                for item in analysis_data:
+                    if self.should_stop:
+                        break
+                        
+                    if isinstance(item, dict) and "Techniques" in item and isinstance(item["Techniques"], list):
+                        tactic_name = item.get("Name", "Без названия")
+                        tactic_desc = item.get("Description", "")
+                        tactics_info[tactic_name] = tactic_desc
+                        
+                        for tech in item["Techniques"]:
+                            if isinstance(tech, dict) and "Description" in tech and "Name" in tech:
+                                tactics_techniques.append({
+                                    "tactic": tactic_name,
+                                    "tech_name": tech["Name"],
+                                    "tech_desc": tech["Description"]
+                                })
+
+                if self.should_stop:
+                    return
+                    
+                tech_texts = [self.preprocess_text(f"{item['tech_name']} {item['tech_desc']}") for item in tactics_techniques]
+                tech_vectors = self.model.encode(tech_texts, batch_size=32, show_progress_bar=False)
+                similarities = cosine_similarity(target_vector, np.array(tech_vectors)).flatten()
+                top_indices = np.argsort(similarities)[-top_n:][::-1]
+                top_results = [(tactics_techniques[i], similarities[i]) for i in top_indices]
+
+                results = [f"Анализ выполнен для файла: {filename}\n\n"]
+                results.append(f"Опорное описание: '{reference_text}'\n\n")
+                
+                for i, (item, sim) in enumerate(top_results, 1):
+                    results.append(
+                        f"Результат #{i} (сходство: {sim:.4f}):\n"
+                        f"Тактика: {item['tactic']}\n"
+                        f"Описание тактики: {tactics_info.get(item['tactic'], 'Нет описания')}\n"
+                        f"Техника: {item['tech_name']}\n"
+                        f"Описание техники: {item['tech_desc']}\n"
+                    )
+            else:
+                items = []
+                for item in analysis_data:
+                    if self.should_stop:
+                        break
+                        
+                    if isinstance(item, dict):
+                        item_name = item.get("Name", "")
+                        item_desc = item.get("Description", "")
+                        if item_name and item_desc:
+                            items.append({
+                                "name": item_name,
+                                "description": item_desc
+                            })
+
+                if self.should_stop:
+                    return
+                    
+                item_texts = [self.preprocess_text(f"{item['name']} {item['description']}") for item in items]
+                item_vectors = self.model.encode(item_texts, batch_size=32, show_progress_bar=False)
+                similarities = cosine_similarity(target_vector, np.array(item_vectors)).flatten()
+                top_indices = np.argsort(similarities)[-top_n:][::-1]
+                top_results = [(items[i], similarities[i]) for i in top_indices]
+
+                results = [f"Анализ выполнен для файла: {filename}\n\n"]
+                results.append(f"Опорное описание: '{reference_text}'\n\n")
+                
+                for i, (item, sim) in enumerate(top_results, 1):
+                    results.append(
+                        f"Результат #{i} (сходство: {sim:.4f}):\n"
+                        f"Название: {item['name']}\n"
+                        f"Описание: {item['description']}\n"
+                    )
+            
+            self.progress.emit(100)
+            self.results_ready.emit(results)
+        
+        except Exception as e:
+            self.message.emit(f"Ошибка при анализе: {str(e)}")
+            self.results_ready.emit([f"Произошла ошибка: {str(e)}"])
+        finally:
+            self.is_working = False
+            self.finished.emit()
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Анализ текстовых описаний")
+        self.setGeometry(100, 100, 1000, 800)
+        
+        self.worker = Worker()
+        self.worker_thread = QThread()
+        self.worker.moveToThread(self.worker_thread)
+        
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.message.connect(self.update_status)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.data_loaded.connect(self.handle_data_loaded)
+        self.worker.results_ready.connect(self.show_results)
+        self.worker.model_loaded.connect(self.handle_model_loaded)
+        
+        self.worker_thread.start()
+        
+        self.responsiveness_timer = QTimer()
+        self.responsiveness_timer.timeout.connect(lambda: QApplication.processEvents())
+        self.responsiveness_timer.start(100)
+        
+        self.init_ui()
+        
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QVBoxLayout()
+        central_widget.setLayout(main_layout)
+        
+        # 1. Группа загрузки данных
+        load_group = QGroupBox("Загрузка данных")
+        load_layout = QVBoxLayout()
+        load_group.setLayout(load_layout)
+        
+        button_layout = QHBoxLayout()
+        
+        self.load_data_btn = QPushButton("Загрузить данные (JSON)")
+        self.load_data_btn.clicked.connect(self.load_data_files)
+        
+        self.load_model_btn = QPushButton("Загрузить модель")
+        self.load_model_btn.clicked.connect(self.load_model_file)
+        
+        self.cancel_btn = QPushButton("Отмена")
+        self.cancel_btn.clicked.connect(self.cancel_operation)
+        self.cancel_btn.setEnabled(False)
+        
+        button_layout.addWidget(self.load_data_btn)
+        button_layout.addWidget(self.load_model_btn)
+        button_layout.addWidget(self.cancel_btn)
+        load_layout.addLayout(button_layout)
+        
+        self.data_progress = QProgressBar()
+        self.data_progress.setRange(0, 100)
+        self.data_progress.setVisible(False)
+        load_layout.addWidget(self.data_progress)
+        
+        self.model_progress = QProgressBar()
+        self.model_progress.setRange(0, 100)
+        self.model_progress.setVisible(False)
+        load_layout.addWidget(self.model_progress)
+        
+        main_layout.addWidget(load_group)
+        
+        # 3. Группа анализа текста
+        analysis_group = QGroupBox("Анализ текста")
+        analysis_layout = QVBoxLayout()
+        analysis_group.setLayout(analysis_layout)
+        
+        file_layout = QHBoxLayout()
+        file_layout.addWidget(QLabel("Файл для анализа:"))
+        
+        self.file_combo = QComboBox()
+        file_layout.addWidget(self.file_combo)
+        analysis_layout.addLayout(file_layout)
+        
+        analysis_layout.addWidget(QLabel("Опорное описание:"))
+        self.reference_input = QTextEdit()
+        self.reference_input.setPlaceholderText("Введите текст для анализа...")
+        analysis_layout.addWidget(self.reference_input)
+        
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel("Формат сохранения:"))
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["Текстовый файл", "Документ Word"])
+        format_layout.addWidget(self.format_combo)
+        analysis_layout.addLayout(format_layout)
+        
+        button_layout = QHBoxLayout()
+        self.analyze_btn = QPushButton("Анализировать")
+        self.analyze_btn.clicked.connect(self.analyze_text)
+        
+        self.save_btn = QPushButton("Сохранить результаты")
+        self.save_btn.clicked.connect(self.save_results)
+        self.save_btn.setEnabled(False)
+        
+        button_layout.addWidget(self.analyze_btn)
+        button_layout.addWidget(self.save_btn)
+        analysis_layout.addLayout(button_layout)
+        
+        self.analysis_progress = QProgressBar()
+        self.analysis_progress.setRange(0, 100)
+        self.analysis_progress.setVisible(False)
+        analysis_layout.addWidget(self.analysis_progress)
+        
+        main_layout.addWidget(analysis_group)
+        
+        # 4. Группа сравнения угроз и уязвимостей
+        compare_group = QGroupBox("Сравнение угроз и уязвимостей")
+        compare_layout = QVBoxLayout()
+        compare_group.setLayout(compare_layout)
+        
+        threat_layout = QHBoxLayout()
+        threat_layout.addWidget(QLabel("Файл угроз:"))
+        
+        self.threat_combo = QComboBox()
+        threat_layout.addWidget(self.threat_combo)
+        compare_layout.addLayout(threat_layout)
+        
+        vuln_layout = QHBoxLayout()
+        vuln_layout.addWidget(QLabel("Файл уязвимостей:"))
+        
+        self.vuln_combo = QComboBox()
+        vuln_layout.addWidget(self.vuln_combo)
+        compare_layout.addLayout(vuln_layout)
+        
+        compare_layout.addWidget(QLabel("Опорное описание:"))
+        self.compare_reference_input = QTextEdit()
+        self.compare_reference_input.setPlaceholderText("Введите текст для сравнения...")
+        compare_layout.addWidget(self.compare_reference_input)
+        
+        self.compare_btn = QPushButton("Сравнить угрозы и уязвимости")
+        self.compare_btn.clicked.connect(self.compare_threats_vulnerabilities)
+        compare_layout.addWidget(self.compare_btn)
+        
+        self.compare_progress = QProgressBar()
+        self.compare_progress.setRange(0, 100)
+        self.compare_progress.setVisible(False)
+        compare_layout.addWidget(self.compare_progress)
+        
+        main_layout.addWidget(compare_group)
+        
+        # 5. Результаты
+        results_group = QGroupBox("Результаты")
+        results_layout = QVBoxLayout()
+        results_group.setLayout(results_layout)
+        
+        self.results_output = QTextEdit()
+        self.results_output.setReadOnly(True)
+        results_layout.addWidget(self.results_output)
+        
+        main_layout.addWidget(results_group)
+        
+        self.status_bar = QLabel("Готов к работе")
+        main_layout.addWidget(self.status_bar)
+        
+        self.current_results = []
+        
+    def set_buttons_enabled(self, enabled):
+        """Блокировка/разблокировка всех кнопок"""
+        self.load_data_btn.setEnabled(enabled)
+        self.load_model_btn.setEnabled(enabled)
+        self.analyze_btn.setEnabled(enabled)
+        self.save_btn.setEnabled(enabled)
+        self.compare_btn.setEnabled(enabled)
+        self.cancel_btn.setEnabled(not enabled)
+        
+    def start_operation(self):
+        """Подготовка к выполнению длительной операции"""
+        self.set_buttons_enabled(False)
+        self.responsiveness_timer.start(100)
+        
+    def end_operation(self):
+        """Завершение длительной операции"""
+        self.set_buttons_enabled(True)
+        self.responsiveness_timer.stop()
+        
+    def cancel_operation(self):
+        """Отмена текущей операции"""
+        self.worker.should_stop = True
+        if hasattr(self, 'compare_worker'):
+            self.compare_worker.should_stop = True
+        self.update_status("Операция прерывается...")
+        self.cancel_btn.setEnabled(False)
+        
+    def load_data_files(self):
+        filepaths, _ = QFileDialog.getOpenFileNames(
+            self, "Выберите файлы данных", "", "JSON Files (*.json)"
+        )
+        
+        if filepaths:
+            self.data_progress.setVisible(True)
+            self.start_operation()
+            self.worker.load_data_from_files(filepaths)
+
+    def load_model_file(self):
+        filepath = QFileDialog.getExistingDirectory(
+            self, "Выберите директорию модели"
+        )
+        
+        if filepath:
+            self.model_progress.setVisible(True)
+            self.start_operation()
+            self.worker.load_model(filepath)
+
+    def analyze_text(self):
+        reference_text = self.reference_input.toPlainText()
+        if not reference_text:
+            QMessageBox.warning(self, "Предупреждение", "Введите опорное описание")
+            return
+            
+        if not hasattr(self.worker, 'model') or not self.worker.model:
+            QMessageBox.warning(self, "Предупреждение", "Сначала загрузите модель")
+            return
+            
+        if not hasattr(self.worker, 'loaded_files') or not self.worker.loaded_files:
+            QMessageBox.warning(self, "Предупреждение", "Сначала загрузите файлы данных")
+            return
+            
+        selected_index = self.file_combo.currentIndex()
+        if selected_index < 0 or selected_index >= len(self.worker.loaded_files):
+            QMessageBox.warning(self, "Предупреждение", "Выберите файл для анализа")
+            return
+            
+        self.analysis_progress.setVisible(True)
+        self.start_operation()
+        self.worker.find_most_similar(reference_text, selected_index)
+
+    def compare_threats_vulnerabilities(self):
+        reference_text = self.compare_reference_input.toPlainText()
+        if not reference_text:
+            QMessageBox.warning(self, "Предупреждение", "Введите опорное описание")
+            return
+            
+        if not hasattr(self.worker, 'model') or not self.worker.model:
+            QMessageBox.warning(self, "Предупреждение", "Сначала загрузите модель")
+            return
+            
+        threat_index = self.threat_combo.currentIndex()
+        vuln_index = self.vuln_combo.currentIndex()
+        
+        if threat_index < 0 or threat_index >= len(self.worker.loaded_files):
+            QMessageBox.warning(self, "Предупреждение", "Выберите файл угроз")
+            return
+            
+        if vuln_index < 0 or vuln_index >= len(self.worker.loaded_files):
+            QMessageBox.warning(self, "Предупреждение", "Выберите файл уязвимостей")
+            return
+            
+        try:
+            self.compare_progress.setVisible(True)
+            self.start_operation()
+            
+            with open(self.worker.loaded_files[threat_index], "rb") as f:
+                threat_data = orjson.loads(f.read())
+                if not isinstance(threat_data, list):
+                    threat_data = [threat_data]
+
+            with open(self.worker.loaded_files[vuln_index], "rb") as f:
+                vulnerability_data = orjson.loads(f.read())
+                if not isinstance(vulnerability_data, list):
+                    vulnerability_data = [vulnerability_data]
+
+            self.compare_thread = QThread()
+            self.compare_worker = CompareWorker(
+                threat_data,
+                vulnerability_data,
+                reference_text,
+                self.worker.model
+            )
+            self.compare_worker.moveToThread(self.compare_thread)
+            
+            self.compare_worker.progress.connect(self.update_progress)
+            self.compare_worker.results_ready.connect(self.show_compare_results)
+            self.compare_worker.finished.connect(self.compare_thread.quit)
+            self.compare_worker.finished.connect(self.compare_worker.deleteLater)
+            self.compare_thread.finished.connect(self.compare_thread.deleteLater)
+            
+            self.compare_thread.started.connect(self.compare_worker.process)
+            self.compare_thread.start()
+
+        except Exception as e:
+            self.update_status(f"Ошибка: {str(e)}")
+            self.compare_progress.setVisible(False)
+            self.end_operation()
+
+    def show_compare_results(self, results):
+        self.compare_progress.setVisible(False)
+        self.end_operation()
+        
+        self.current_results = results
+        self.results_output.clear()
+        for res in results:
+            self.results_output.append(res)
+            self.results_output.append("")
+            
+        self.save_btn.setEnabled(True)
+        self.update_status("Сравнение завершено")
+        QMessageBox.information(self, "Успех", "Сравнение выполнено успешно!")
+
+    def show_results(self, results):
+        self.analysis_progress.setVisible(False)
+        self.end_operation()
+        
+        self.current_results = results
+        self.results_output.clear()
+        for res in results:
+            self.results_output.append(res)
+            self.results_output.append("")
+            
+        self.save_btn.setEnabled(True)
+        self.update_status("Результаты анализа получены")
+        QMessageBox.information(self, "Успех", "Анализ завершен успешно!")
+
+    def handle_data_loaded(self, success):
+        self.data_progress.setVisible(False)
+        self.end_operation()
+        
+        if success:
+            self.file_combo.clear()
+            self.threat_combo.clear()
+            self.vuln_combo.clear()
+            
+            for file in self.worker.loaded_files:
+                filename = os.path.basename(file)
+                self.file_combo.addItem(filename)
+                self.threat_combo.addItem(filename)
+                self.vuln_combo.addItem(filename)
+                
+            self.update_status(f"Загружено {len(self.worker.loaded_files)} файлов")
+            QMessageBox.information(self, "Успех", "Данные успешно загружены!")
+        else:
+            self.update_status("Ошибка при загрузке данных")
+            QMessageBox.critical(self, "Ошибка", "Не удалось загрузить данные")
+
+    def handle_model_loaded(self, success):
+        self.model_progress.setVisible(False)
+        self.end_operation()
+        
+        if success:
+            self.update_status("Модель успешно загружена")
+            QMessageBox.information(self, "Успех", "Модель успешно загружена!")
+        else:
+            self.update_status("Ошибка при загрузке модели")
+            QMessageBox.critical(self, "Ошибка", "Не удалось загрузить модель")
+
+    def update_status(self, message):
+        self.status_bar.setText(message)
+
+    def update_progress(self, value):
+        if self.data_progress.isVisible():
+            self.data_progress.setValue(value)
+        elif self.model_progress.isVisible():
+            self.model_progress.setValue(value)
+        elif self.analysis_progress.isVisible():
+            self.analysis_progress.setValue(value)
+        elif self.compare_progress.isVisible():
+            self.compare_progress.setValue(value)
+
+    def save_results(self):
+        if not self.current_results:
+            QMessageBox.warning(self, "Предупреждение", "Нет результатов для сохранения")
+            return
+            
+        selected_format = self.format_combo.currentText()
+        if selected_format == "Текстовый файл":
+            filepath, _ = QFileDialog.getSaveFileName(
+                self, "Сохранить результаты", "", "Text Files (*.txt)"
+            )
+            if filepath:
+                if not filepath.endswith('.txt'):
+                    filepath += '.txt'
+                try:
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        for line in self.current_results:
+                            f.write(line + "\n\n")
+                    self.update_status(f"Результаты сохранены в {filepath}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить результаты: {str(e)}")
+        elif selected_format == "Документ Word" and Document:
+            filepath, _ = QFileDialog.getSaveFileName(
+                self, "Сохранить результаты", "", "Word Documents (*.docx)"
+            )
+            if filepath:
+                if not filepath.endswith('.docx'):
+                    filepath += '.docx'
+                try:
+                    document = Document()
+                    for line in self.current_results:
+                        document.add_paragraph(line)
+                        document.add_paragraph("")
+                    document.save(filepath)
+                    self.update_status(f"Результаты сохранены в {filepath}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить результаты: {str(e)}")
+        else:
+            QMessageBox.warning(self, "Ошибка", "Формат Word недоступен. Установите python-docx")
+
+    def closeEvent(self, event):
+        self.worker.should_stop = True
+        if hasattr(self, 'compare_worker'):
+            self.compare_worker.should_stop = True
+        self.responsiveness_timer.stop()
+        
+        if self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            if not self.worker_thread.wait(2000):
+                self.worker_thread.terminate()
+                
+        if hasattr(self, 'compare_thread') and self.compare_thread.isRunning():
+            self.compare_thread.quit()
+            if not self.compare_thread.wait(2000):
+                self.compare_thread.terminate()
+                
+        event.accept()
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    
+    app.setStyle('Fusion')
+    
+    font = QFont()
+    font.setFamily("Segoe UI")
+    font.setPointSize(10)
+    app.setFont(font)
+    
+    window = MainWindow()
+    
+    if Document is None:
+        window.format_combo.setItemText(1, "Документ Word (недоступен)")
+        window.format_combo.model().item(1).setEnabled(False)
+    
+    window.show()
+    sys.exit(app.exec())
