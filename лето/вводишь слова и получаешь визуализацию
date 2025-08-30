@@ -1,0 +1,172 @@
+import fasttext
+import fasttext.util
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from sklearn.manifold import TSNE
+import plotly.express as px
+
+# Загрузка модели
+print("Загрузка модели FastText...")
+ft_model = fasttext.load_model('cc.ru.300.bin')
+print("Модель загружена успешно!")
+
+def visualize_user_words():
+    """Функция для визуализации слов, введенных пользователем"""
+    
+    # Запрос слов у пользователя
+    print("\n" + "="*50)
+    print("Введите слова для визуализации (через запятую):")
+    user_input = input("Слова: ").strip()
+    
+    if not user_input:
+        print("Не введено ни одного слова!")
+        return
+    
+    # Разделяем ввод на отдельные слова
+    words_to_visualize = [word.strip() for word in user_input.split(',')]
+    words_to_visualize = [word for word in words_to_visualize if word]  # Убираем пустые
+    
+    if not words_to_visualize:
+        print("Не найдено validных слов!")
+        return
+    
+    print(f"\nОбработка {len(words_to_visualize)} слов...")
+    
+    # Извлекаем векторы
+    word_vectors = []
+    valid_words = []
+    found_words = []
+    not_found_words = []
+    
+    for word in words_to_visualize:
+        try:
+            vec = ft_model.get_word_vector(word)
+            word_vectors.append(vec)
+            valid_words.append(word)
+            found_words.append(word)
+        except:
+            print(f"Слово '{word}' не найдено в модели. Пропускаем.")
+            not_found_words.append(word)
+    
+    if not valid_words:
+        print("Ни одно из слов не найдено в модели!")
+        return
+    
+    X = np.array(word_vectors)
+    
+    # Применяем T-SNE для 3D
+    print("Создание 3D визуализации...")
+    tsne = TSNE(n_components=3, perplexity=min(5, len(valid_words)-1), 
+                random_state=42, n_iter=1000)
+    X_tsne = tsne.fit_transform(X)
+    
+    # Автоматически определяем категории по семантической близости
+    from sklearn.cluster import KMeans
+    
+    n_clusters = min(5, len(valid_words))  # Не больше кластеров, чем слов
+    if len(valid_words) > 1:
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        clusters = kmeans.fit_predict(X_tsne)
+    else:
+        clusters = [0]  # Если только одно слово
+    
+    # Создаем DataFrame
+    df = pd.DataFrame({
+        'x': X_tsne[:, 0],
+        'y': X_tsne[:, 1], 
+        'z': X_tsne[:, 2],
+        'word': valid_words,
+        'cluster': clusters,
+        'size': 15  # Размер точек
+    })
+    
+    # Создаем интерактивную визуализацию
+    fig = go.Figure()
+    
+    # Добавляем точки с подписями
+    fig.add_trace(go.Scatter3d(
+        x=df['x'],
+        y=df['y'],
+        z=df['z'],
+        mode='markers+text',
+        marker=dict(
+            size=df['size'],
+            color=df['cluster'],
+            colorscale='Viridis',
+            opacity=0.8,
+            line=dict(width=2, color='DarkSlateGrey')
+        ),
+        text=df['word'],
+        textposition="middle center",
+        textfont=dict(size=14, color='black', family="Arial Black"),
+        hovertemplate=
+        '<b>%{text}</b><br>' +
+        'X: %{x:.3f}<br>' +
+        'Y: %{y:.3f}<br>' +
+        'Z: %{z:.3f}<br>' +
+        '<extra></extra>'
+    ))
+    
+    # Настраиваем layout
+    fig.update_layout(
+        title=dict(
+            text=f'<b>3D Семантическая карта слов<br>Всего слов: {len(valid_words)}</b>',
+            font=dict(size=20, family='Arial'),
+            x=0.5,
+            xanchor='center'
+        ),
+        scene=dict(
+            xaxis_title='X измерение T-SNE',
+            yaxis_title='Y измерение T-SNE', 
+            zaxis_title='Z измерение T-SNE',
+            camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))
+        ),
+        width=1000,
+        height=700,
+        showlegend=False
+    )
+    
+    # Сохраняем и показываем
+    filename = f"user_words_visualization.html"
+    fig.write_html(filename)
+    print(f"Визуализация сохранена в файл: {filename}")
+    fig.show()
+    
+    # Выводим статистику
+    print(f"\n📊 Статистика:")
+    print(f"Найдено слов в модели: {len(found_words)}")
+    if not_found_words:
+        print(f"Не найдено в модели: {', '.join(not_found_words)}")
+    print(f"Семантических кластеров обнаружено: {len(set(clusters))}")
+    
+    # Показываем семантически близкие слова
+    if len(found_words) > 1:
+        print(f"\n🎯 Близкие по смыслу пары:")
+        from sklearn.metrics.pairwise import cosine_similarity
+        similarities = cosine_similarity(X)
+        
+        # Находим самые близкие пары
+        close_pairs = []
+        for i in range(len(valid_words)):
+            for j in range(i+1, len(valid_words)):
+                sim = similarities[i, j]
+                if sim > 0.6:  # Порог similarity
+                    close_pairs.append((valid_words[i], valid_words[j], sim))
+        
+        # Сортируем по similarity
+        close_pairs.sort(key=lambda x: x[2], reverse=True)
+        
+        for word1, word2, sim in close_pairs[:5]:  # Показываем топ-5 пар
+            print(f"  {word1} ↔ {word2} (сходство: {sim:.3f})")
+
+# Бесконечный цикл для многократного использования
+while True:
+    visualize_user_words()
+    
+    # Спрашиваем, хочет ли пользователь продолжить
+    print("\n" + "="*50)
+    continue_input = input("Хотите визуализировать еще слова? (y/n): ").strip().lower()
+    if continue_input not in ['y', 'yes', 'д', 'да']:
+        print("До свидания!")
+        break
