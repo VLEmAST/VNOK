@@ -1,0 +1,239 @@
+import fasttext
+import fasttext.util
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px  # Добавляем этот импорт
+from sklearn.manifold import TSNE
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import StandardScaler
+
+# Загрузка модели
+print("🔄 Загрузка модели FastText...")
+ft_model = fasttext.load_model('cc.ru.300.bin')
+print("✅ Модель загружена успешно!")
+
+def get_nearest_words(target_word, top_n=10):
+    """Получает top_n самых близких слов к целевому слову"""
+    try:
+        # Получаем вектор целевого слова
+        target_vector = ft_model.get_word_vector(target_word)
+        target_vector = target_vector.reshape(1, -1)
+        
+        # Получаем ближайшие слова
+        nearest_words = ft_model.get_nearest_neighbors(target_word, k=top_n)
+        
+        return nearest_words, target_vector
+    except Exception as e:
+        print(f"❌ Ошибка при обработке слова '{target_word}': {e}")
+        return None, None
+
+def visualize_nearest_words():
+    """Основная функция визуализации"""
+    
+    print("\n" + "="*60)
+    print("🎯 ВИЗУАЛИЗАЦИЯ БЛИЖАЙШИХ СЛОВ")
+    print("="*60)
+    
+    # Запрос слов у пользователя
+    user_input = input("Введите слова через запятую: ").strip()
+    
+    if not user_input:
+        print("❌ Не введено ни одного слова!")
+        return
+    
+    words_to_process = [word.strip() for word in user_input.split(',') if word.strip()]
+    
+    if not words_to_process:
+        print("❌ Не найдено validных слов!")
+        return
+    
+    print(f"\n🔍 Поиск ближайших слов для: {', '.join(words_to_process)}")
+    
+    # Собираем все слова для визуализации
+    all_words_data = []
+    target_words_info = {}
+    
+    for target_word in words_to_process:
+        print(f"📋 Обработка слова: '{target_word}'...")
+        
+        nearest_words, target_vector = get_nearest_words(target_word, top_n=10)
+        
+        if nearest_words is None:
+            continue
+        
+        # Добавляем целевое слово
+        all_words_data.append({
+            'word': target_word,
+            'vector': target_vector.flatten(),
+            'is_target': True,
+            'target_group': target_word,
+            'similarity': 1.0
+        })
+        
+        # Добавляем ближайшие слова
+        for similarity, neighbor_word in nearest_words:
+            all_words_data.append({
+                'word': neighbor_word,
+                'vector': ft_model.get_word_vector(neighbor_word),
+                'is_target': False,
+                'target_group': target_word,
+                'similarity': similarity
+            })
+        
+        target_words_info[target_word] = {
+            'count': len(nearest_words) + 1,
+            'neighbors': [word for _, word in nearest_words]
+        }
+    
+    if not all_words_data:
+        print("❌ Не удалось обработать ни одно слово!")
+        return
+    
+    # Создаем DataFrame
+    df = pd.DataFrame(all_words_data)
+    
+    # Преобразуем векторы в массив
+    X = np.array(df['vector'].tolist())
+    words_list = df['word'].tolist()
+    
+    print(f"📊 Всего слов для визуализации: {len(df)}")
+    
+    # Применяем T-SNE
+    print("🎨 Создание 3D визуализации...")
+    
+    # Масштабируем данные
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Настраиваем perplexity в зависимости от количества слов
+    n_samples = len(df)
+    perplexity = min(5, max(2, n_samples // 10))
+    
+    tsne = TSNE(
+        n_components=3,
+        perplexity=perplexity,
+        random_state=42,
+        n_iter=1000,
+        learning_rate=200
+    )
+    
+    X_tsne = tsne.fit_transform(X_scaled)
+    
+    # Добавляем координаты в DataFrame
+    df['x'] = X_tsne[:, 0]
+    df['y'] = X_tsne[:, 1]
+    df['z'] = X_tsne[:, 2]
+    
+    # Создаем интерактивную визуализацию
+    fig = go.Figure()
+    
+    # Цвета для разных целевых слов (используем палитру из plotly express)
+    colors = px.colors.qualitative.Bold
+    color_map = {}
+    
+    for i, target_word in enumerate(target_words_info.keys()):
+        color_map[target_word] = colors[i % len(colors)]
+    
+    # Добавляем точки для каждого целевого слова и его соседей
+    for target_word in target_words_info.keys():
+        group_df = df[df['target_group'] == target_word]
+        
+        # Целевое слово (большая точка)
+        target_df = group_df[group_df['is_target'] == True]
+        if not target_df.empty:
+            fig.add_trace(go.Scatter3d(
+                x=target_df['x'],
+                y=target_df['y'],
+                z=target_df['z'],
+                mode='markers+text',
+                marker=dict(
+                    size=15,
+                    color=color_map[target_word],
+                    symbol='diamond',
+                    line=dict(width=3, color='white')
+                ),
+                text=target_df['word'],
+                textposition="middle center",
+                textfont=dict(size=16, color='white', family="Arial Black"),
+                name=f"🎯 {target_word} (целевое)",
+                hovertemplate=
+                '<b>Целевое слово: %{text}</b><br>' +
+                '<extra></extra>'
+            ))
+        
+        # Ближайшие слова
+        neighbors_df = group_df[group_df['is_target'] == False]
+        if not neighbors_df.empty:
+            fig.add_trace(go.Scatter3d(
+                x=neighbors_df['x'],
+                y=neighbors_df['y'],
+                z=neighbors_df['z'],
+                mode='markers+text',
+                marker=dict(
+                    size=8,
+                    color=color_map[target_word],
+                    opacity=0.8,
+                    line=dict(width=1, color='white')
+                ),
+                text=neighbors_df['word'],
+                textposition="middle center",
+                textfont=dict(size=10, color='black'),
+                name=f"📌 {target_word} (соседи)",
+                hovertemplate=
+                '<b>%{text}</b><br>' +
+                'Близость к "' + target_word + '": %{customdata:.3f}<br>' +
+                '<extra></extra>',
+                customdata=neighbors_df['similarity']
+            ))
+    
+    # Настраиваем layout
+    fig.update_layout(
+        title=dict(
+            text=f'<b>3D Визуализация ближайших слов<br>'
+                 f'Целевые слова: {", ".join(target_words_info.keys())}</b>',
+            font=dict(size=20, family='Arial'),
+            x=0.5,
+            xanchor='center'
+        ),
+        scene=dict(
+            xaxis_title='X измерение T-SNE',
+            yaxis_title='Y измерение T-SNE',
+            zaxis_title='Z измерение T-SNE',
+            camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))
+        ),
+        width=1200,
+        height=800,
+        legend=dict(
+            title=dict(text='<b>Группы слов</b>'),
+            x=0.02,
+            y=0.98,
+            bgcolor='rgba(255, 255, 255, 0.9)'
+        )
+    )
+    
+    # Сохраняем результат
+    filename = "nearest_words_visualization.html"
+    fig.write_html(filename)
+    print(f"💾 Визуализация сохранена: {filename}")
+    
+    # Показываем статистику
+    print(f"\n📊 СТАТИСТИКА:")
+    print(f"Всего визуализировано слов: {len(df)}")
+    print(f"Целевых слов: {len(target_words_info)}")
+    
+    for target_word, info in target_words_info.items():
+        print(f"\n🎯 '{target_word}':")
+        print(f"   Ближайшие слова: {', '.join(info['neighbors'])}")
+    
+    fig.show()
+
+# Основной цикл
+while True:
+    visualize_nearest_words()
+    
+    print("\n" + "="*60)
+    continue_input = input("Хотите визуализировать еще слова? (y/n): ").strip().lower()
+    if continue_input not in ['y', 'yes', 'д', 'да']:
+        print("👋 До свидания!")
+        break
