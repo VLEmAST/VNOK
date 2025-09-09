@@ -1,0 +1,241 @@
+from flask import Flask, request, jsonify
+import gensim.models.fasttext
+import numpy as np
+from scipy.spatial.distance import cosine
+import json
+import os
+
+app = Flask(__name__)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))#путь корневого каталога
+DATABASE_DIR = os.path.join(SCRIPT_DIR, 'Database')#путь к папке с базами данных
+FASTTEXT_MODEL_PATH = os.path.join(SCRIPT_DIR, 'model.bin')#путь к FastText модели
+
+try:
+    fasttext_model = gensim.models.fasttext.load_facebook_model(FASTTEXT_MODEL_PATH)
+    print("Модель FastText успешно загружена")#загрузка FastText модели
+except Exception as e:
+    print(f"Ошибка загрузки FastText модели: {e}")
+    fasttext_model = None#обработка исключений
+
+def load_json(file_name, dto_type):
+    file_path = os.path.join(DATABASE_DIR, file_name)
+    try:
+        if not os.path.exists(file_path):
+            print(f"Ошибка: файл {file_path} не найден")
+            return {"DtoType": dto_type, "Value": []}
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            print(f"Файл {file_name} успешно загружен")
+            return data
+    except json.JSONDecodeError as e:
+        print(f"Ошибка: файл {file_path} не является валидным JSON - {e}")
+        return {"DtoType": dto_type, "Value": []}
+    except Exception as e:
+        print(f"Ошибка загрузки {file_path}: {e}")
+        return {"DtoType": dto_type, "Value": []}#функция загрузки json
+
+def find_closest(db_data, input_vector, text_description, dto_type, filteringCvss):
+    value = db_data.get('Value', [])
+    if not value:
+        print(f"База DtoType {dto_type} пуста или не содержит Value")
+        return None, 0.0
+
+    max_similarity = -1.0
+    best_guid = None
+
+    try:
+        # Функция для проверки CVSS (в базах нет CvssScore, игнорируем фильтр)
+        def passes_cvss_filter(item):
+            return True  # Отключаем CVSS-фильтрацию, так как поля CvssScore нет
+
+        if dto_type == 14:  # outcomesDb
+            # Только Technologys
+            techns = value.get('Technologys', []) if isinstance(value, dict) else []
+            for item in techns:
+                if not passes_cvss_filter(item):
+                    continue
+                desc = item.get('Description', '')
+                print(f"Сравниваем Technology Description: {desc}")
+                desc_vector = get_sentence_vector(desc, fasttext_model)
+                similarity = 1 - cosine(input_vector, desc_vector) if np.any(desc_vector) else 0.0
+                print(f"Similarity для Technology: {similarity}")
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    best_guid = item.get('GuidId', None)
+                    print(f"Обновлено: max_similarity={max_similarity}, best_guid={best_guid}")
+
+        elif dto_type == 12:  # protectionMeasureDb
+            for item in value:
+                if not passes_cvss_filter(item):
+                    continue
+                desc = item.get('Description', '')
+                print(f"Сравниваем ProtectionMeasure Description: {desc}")
+                desc_vector = get_sentence_vector(desc, fasttext_model)
+                similarity = 1 - cosine(input_vector, desc_vector) if np.any(desc_vector) else 0.0
+                print(f"Similarity для ProtectionMeasure: {similarity}")
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    best_guid = item.get('GuidId', None)
+                    print(f"Обновлено: max_similarity={max_similarity}, best_guid={best_guid}")
+
+        elif dto_type == 8:  # tacticDb
+            for item in value:
+                if not passes_cvss_filter(item):
+                    continue
+                desc = item.get('Description', '')
+                print(f"Сравниваем Tactic Description: {desc}")
+                desc_vector = get_sentence_vector(desc, fasttext_model)
+                similarity = 1 - cosine(input_vector, desc_vector) if np.any(desc_vector) else 0.0
+                print(f"Similarity для Tactic: {similarity}")
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    best_guid = item.get('GuidId', None)
+                    print(f"Обновлено: max_similarity={max_similarity}, best_guid={best_guid}")
+                for tech in item.get('Techniques', []):
+                    desc = tech.get('Description', '')
+                    print(f"Сравниваем Technique Description: {desc}")
+                    desc_vector = get_sentence_vector(desc, fasttext_model)
+                    similarity = 1 - cosine(input_vector, desc_vector) if np.any(desc_vector) else 0.0
+                    print(f"Similarity для Technique: {similarity}")
+                    if similarity > max_similarity:
+                        max_similarity = similarity
+                        best_guid = tech.get('GuidId', None)
+                        print(f"Обновлено: max_similarity={max_similarity}, best_guid={best_guid}")
+
+        elif dto_type == 6:  # уязвимости
+            for item in value:
+                if not passes_cvss_filter(item):
+                    continue
+                desc = item.get('Description', '')
+                print(f"Сравниваем vulnerabilitie Description: {desc}")
+                desc_vector = get_sentence_vector(desc, fasttext_model)
+                similarity = 1 - cosine(input_vector, desc_vector) if np.any(desc_vector) else 0.0
+                print(f"Similarity для vulnerabilitie: {similarity}")
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    best_guid = item.get('GuidId', None)
+                    print(f"Обновлено: max_similarity={max_similarity}, best_guid={best_guid}")
+
+        elif dto_type == 5:  # threatDb
+            for item in value:
+                if not passes_cvss_filter(item):
+                    continue
+                desc = item.get('Description', '')
+                print(f"Сравниваем Threat Description: {desc}")
+                desc_vector = get_sentence_vector(desc, fasttext_model)
+                similarity = 1 - cosine(input_vector, desc_vector) if np.any(desc_vector) else 0.0
+                print(f"Similarity для Threat: {similarity}")
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    best_guid = item.get('GuidId', None)
+                    print(f"Обновлено: max_similarity={max_similarity}, best_guid={best_guid}")
+
+    except Exception as e:
+        print(f"Ошибка в find_closest для DtoType {dto_type}: {e}")
+        return None, 0.0
+
+    print(f"Результат для DtoType {dto_type}: GuidId={best_guid}, Similarity={max_similarity}")
+    return best_guid, max_similarity
+
+def get_sentence_vector(text, model):
+    """Генерация вектора предложения путем усреднения векторов слов."""
+    if model is None:
+        print(f"Модель FastText не загружена, возвращаем нулевой вектор для текста: {text}")
+        return np.zeros(300)
+    words = text.split()
+    vectors = [model.wv[word] for word in words if word in model.wv]
+    if not vectors:
+        print(f"Ни одно слово из текста '{text}' не найдено в модели FastText")
+        return np.zeros(model.vector_size)
+    return np.mean(vectors, axis=0)
+
+# Загрузка баз данных
+outcomes_db = load_json('outcomesDb.json', 14)
+protection_measure_db = load_json('protectionMeasureDb.json', 12)
+tactic_db = load_json('tacticDb.json', 8)
+threat_db = load_json('threatDb.json', 5)
+vulnerabilitie_db = load_json('vulnerabilitieDb.json', 6)
+
+# Словарь баз данных
+dbs = {
+    14: outcomes_db,
+    12: protection_measure_db,
+    8: tactic_db,
+    5: threat_db,
+    6: vulnerabilitie_db
+}
+
+# Маппинг DtoType к полям ответа
+DTO_TYPE_TO_FIELD = {
+    15: 'OntologyId',
+    14: 'TechnologyId',
+    12: 'ProtectionMeasureId',
+    8: 'TacticId',
+    6: 'vulnerabilitieDb',
+    5: 'ThreadId'
+}
+
+@app.route('/Matcher', methods=['POST'])
+def Matcher():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': 'Отсутствуют данные JSON'}), 400
+
+        textDescription = data.get('TextDescription')
+        modelName = data.get('ModelName')
+        filteringCvss = data.get('FilteringCvss')
+
+        if textDescription is None or modelName is None or filteringCvss is None:
+            return jsonify({'error': 'Недостаточно параметров'}), 400
+
+        textDescription = str(textDescription)
+        modelName = str(modelName)
+        filteringCvss = bool(filteringCvss)
+
+        if fasttext_model is None:
+            return jsonify({'error': 'Модель FastText не загружена'}), 500
+
+        # Получение вектора для входного описания
+        print(f"Обрабатываем TextDescription: {textDescription}")
+        input_vector = get_sentence_vector(textDescription, fasttext_model)
+        if not np.any(input_vector):
+            print(f"Входной текст '{textDescription}' не распознан моделью FastText")
+            return jsonify({'error': 'Входной текст не распознан моделью FastText'}), 400
+
+        results = {}
+        similarities = []
+
+        # Поиск ближайших совпадений для каждой базы данных
+        for dto_type, field in DTO_TYPE_TO_FIELD.items():
+            if dto_type in dbs:
+                print(f"Поиск совпадений для DtoType {dto_type} ({field})")
+                best_guid, sim = find_closest(dbs[dto_type], input_vector, textDescription, dto_type, filteringCvss)
+                results[field] = best_guid
+                if sim > 0:
+                    similarities.append(sim)
+            else:
+                print(f"База для DtoType {dto_type} не найдена")
+                results[field] = None
+
+        # Вычисление среднего коэффициента
+        coefficient = sum(similarities) / len(similarities) if similarities else 0.0
+        print(f"Найдено {len(similarities)} ненулевых similarities: {similarities}")
+        print(f"Средний коэффициент: {coefficient}")
+      
+        #Формирование ответа в формате списка словарей
+        response_item = {'Coefficient': coefficient}
+        for field in DTO_TYPE_TO_FIELD.values():
+            response_item[field] = results.get(field)
+        response = [response_item]
+
+        print(f"Ответ сервера: {response}")
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"Ошибка сервера: {e}")
+        return jsonify({'error': f'Внутренняя ошибка сервера: {str(e)}'}), 500
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=True)
