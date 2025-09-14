@@ -1,0 +1,387 @@
+from flask import Flask, request, jsonify
+import gensim.models.word2vec
+import fasttext  # Используем библиотеку fasttext
+import numpy as np
+import json
+import os
+import time
+import concurrent.futures
+import threading
+import heapq
+import re
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+import nltk
+import pymorphy3
+
+# Download NLTK data (run once)
+nltk.download('punkt')
+nltk.download('stopwords')
+
+app = Flask(__name__)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_DIR = os.path.join(SCRIPT_DIR, 'Database')
+WORD2VEC_MODEL_PATH = os.path.join(SCRIPT_DIR, 'model_word2vec.bin')
+FASTTEXT_MODEL_PATH = os.path.join(SCRIPT_DIR, 'model_fasttext.bin')
+
+# Глобальные переменные для кэширования и модели
+description_vector_cache = {}
+cache_lock = threading.Lock()
+model = None
+model_type = None  # "word2vec" или "fasttext"
+use_pos_tags = False  # Для Word2Vec: есть ли POS-тэги
+morph = pymorphy3.MorphAnalyzer()  # Инициализация морфологического анализатора
+stop_words = set(stopwords.words('russian')) | {'быть', 'это', 'такой', 'который', 'все', 'этот'}
+
+def load_model(model_name):
+    """Загрузка модели в зависимости от model_name"""
+    global model, model_type, use_pos_tags
+    if model is not None and model_type == model_name:
+        return model
+
+    if model_name == "word2vec":
+        model_path = WORD2VEC_MODEL_PATH
+        print(f"Попытка загрузки Word2Vec модели из {model_path}")
+        if not os.path.exists(model_path):
+            print(f"Ошибка: файл {model_path} не найден")
+            return None
+        try:
+            model = gensim.models.KeyedVectors.load_word2vec_format(model_path, binary=True)
+            print("Модель Word2Vec успешно загружена (бинарный формат)")
+        except Exception as e:
+            print(f"Не удалось загрузить как бинарный Word2Vec: {e}")
+            try:
+                model = gensim.models.KeyedVectors.load_word2vec_format(model_path, binary=False)
+                print("Модель Word2Vec успешно загружена (текстовый формат)")
+            except Exception as e:
+                print(f"Не удалось загрузить как текстовый Word2Vec: {e}")
+                try:
+                    model = gensim.models.Word2Vec.load(model_path)
+                    print("Модель Word2Vec успешно загружена (Gensim формат)")
+                except Exception as e:
+                    print(f"Не удалось загрузить как Gensim Word2Vec: {e}")
+                    return None
+        use_pos_tags = any('_' in key for key in list(model.key_to_index.keys())[:100])
+        print(f"Модель Word2Vec использует POS-тэги: {use_pos_tags}")
+    elif model_name == "fasttext":
+        model_path = FASTTEXT_MODEL_PATH
+        print(f"Попытка загрузки FastText модели из {model_path}")
+        print(f"Файл существует: {os.path.exists(model_path)}")
+        print(f"Размер файла: {os.path.getsize(model_path) if os.path.exists(model_path) else 'N/A'} байт")
+        if not os.path.exists(model_path):
+            print(f"Ошибка: файл {model_path} не найден")
+            return None
+        try:
+            model = fasttext.load_model(model_path)
+            print(f"Модель FastText успешно загружена, размер вектора: {len(model.get_word_vector('тест'))}")
+        except Exception as e:
+            print(f"Не удалось загрузить FastText: {e}")
+            return None
+    else:
+        print(f"Ошибка: неизвестное имя модели '{model_name}'")
+        return None
+
+    model_type = model_name
+    return model
+
+def load_json(file_name, dto_type):
+    file_path = os.path.join(DATABASE_DIR, file_name)
+    try:
+        if not os.path.exists(file_path):
+            print(f"Ошибка: файл {file_path} не найден")
+            return {"DtoType": dto_type, "Value": []}
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            print(f"Файл {file_name} успешно загружен")
+            return data
+    except json.JSONDecodeError as e:
+        print(f"Ошибка: файл {file_path} не является валидным JSON - {e}")
+        return {"DtoType": dto_type, "Value": []}
+    except Exception as e:
+        print(f"Ошибка загрузки {file_path}: {e}")
+        return {"DtoType": dto_type, "Value": []}
+
+def get_sentence_vector(text, model, model_name):
+    """Генерация вектора предложения с потокобезопасным кэшированием"""
+    if model is None:
+        return np.zeros(300)
+    
+    cache_key = f"{text}_{model_name}"
+    
+    with cache_lock:
+        if cache_key in description_vector_cache:
+            return description_vector_cache[cache_key]
+    
+    vectors = []
+    if model_name == "word2vec":
+        # Предобработка для Word2Vec: нижний регистр, удаление знаков, токенизация NLTK, стоп-слова, лемматизация
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', '', text)
+        words = [word for word in word_tokenize(text) if word not in stop_words]
+        for word in words:
+            parsed = morph.parse(word)[0]
+            normal_form = parsed.normal_form
+            pos = parsed.tag.POS
+            if pos and use_pos_tags:
+                pos_map = {
+                    'NOUN': 'NOUN', 'VERB': 'VERB', 'ADJF': 'ADJ', 'ADJS': 'ADJ',
+                    'ADVB': 'ADV', 'INFN': 'VERB', 'PRTF': 'ADJ', 'PRTS': 'ADJ'
+                }
+                pos_suffix = pos_map.get(pos, '')
+                if pos_suffix:
+                    word_with_pos = f"{normal_form}_{pos_suffix}"
+                    if word_with_pos in model:
+                        vectors.append(model[word_with_pos])
+                        continue
+            if normal_form in model:
+                vectors.append(model[normal_form])
+    else:  # FastText
+        # Минимальная предобработка: только разделение по пробелам
+        words = text.split()
+        for word in words:
+            vectors.append(model.get_word_vector(word))  # Используем fasttext API
+    
+    if not vectors:
+        vector = np.zeros(300)  # Убедитесь, что размер совпадает с размером векторов модели
+    else:
+        vector = np.mean(vectors, axis=0)
+    
+    with cache_lock:
+        description_vector_cache[cache_key] = vector
+    
+    return vector
+
+def get_top_n_for_category(db_data, input_vector, input_norm, model, model_name, n=10):
+    value = db_data.get('Value', [])
+    if not value:
+        return []
+
+    top_results = []
+    
+    for item in value:
+        desc = item.get('Description', '')
+        if not desc:
+            continue
+            
+        desc_vector = get_sentence_vector(desc, model, model_name)
+        
+        if np.any(desc_vector):
+            desc_norm = np.linalg.norm(desc_vector)
+            if desc_norm > 0:
+                dot_product = np.dot(input_vector, desc_vector)
+                similarity = dot_product / (input_norm * desc_norm)
+                
+                if len(top_results) < n:
+                    heapq.heappush(top_results, (similarity, item.get('GuidId')))
+                else:
+                    if similarity > top_results[0][0]:
+                        heapq.heapreplace(top_results, (similarity, item.get('GuidId')))
+
+    top_results.sort(key=lambda x: x[0], reverse=True)
+    return top_results
+
+def get_top_n_outcomes(db_data, input_vector, input_norm, model, model_name, n=10):
+    value = db_data.get('Value', {})
+    techns = value.get('Technologys', [])
+    if not techns:
+        return []
+
+    top_results = []
+    
+    for item in techns:
+        desc = item.get('Description', '')
+        if not desc:
+            continue
+            
+        desc_vector = get_sentence_vector(desc, model, model_name)
+        
+        if np.any(desc_vector):
+            desc_norm = np.linalg.norm(desc_vector)
+            if desc_norm > 0:
+                dot_product = np.dot(input_vector, desc_vector)
+                similarity = dot_product / (input_norm * desc_norm)
+                
+                if len(top_results) < n:
+                    heapq.heappush(top_results, (similarity, item.get('GuidId')))
+                else:
+                    if similarity > top_results[0][0]:
+                        heapq.heapreplace(top_results, (similarity, item.get('GuidId')))
+
+    top_results.sort(key=lambda x: x[0], reverse=True)
+    return top_results
+
+def get_top_n_tactics(db_data, input_vector, input_norm, model, model_name, n=10):
+    value = db_data.get('Value', [])
+    if not value:
+        return []
+
+    top_results = []
+    
+    for item in value:
+        desc = item.get('Description', '')
+        if desc:
+            desc_vector = get_sentence_vector(desc, model, model_name)
+            if np.any(desc_vector):
+                desc_norm = np.linalg.norm(desc_vector)
+                if desc_norm > 0:
+                    dot_product = np.dot(input_vector, desc_vector)
+                    similarity = dot_product / (input_norm * desc_norm)
+                    
+                    if len(top_results) < n:
+                        heapq.heappush(top_results, (similarity, item.get('GuidId')))
+                    else:
+                        if similarity > top_results[0][0]:
+                            heapq.heapreplace(top_results, (similarity, item.get('GuidId')))
+        
+        for tech in item.get('Techniques', []):
+            desc = tech.get('Description', '')
+            if desc:
+                desc_vector = get_sentence_vector(desc, model, model_name)
+                if np.any(desc_vector):
+                    desc_norm = np.linalg.norm(desc_vector)
+                    if desc_norm > 0:
+                        dot_product = np.dot(input_vector, desc_vector)
+                        similarity = dot_product / (input_norm * desc_norm)
+                        
+                        if len(top_results) < n:
+                            heapq.heappush(top_results, (similarity, tech.get('GuidId')))
+                        else:
+                            if similarity > top_results[0][0]:
+                                heapq.heapreplace(top_results, (similarity, tech.get('GuidId')))
+
+    top_results.sort(key=lambda x: x[0], reverse=True)
+    return top_results
+
+# Загрузка баз данных
+outcomes_db = load_json('outcomesDb.json', 14)
+protection_measure_db = load_json('protectionMeasureDb.json', 12)
+tactic_db = load_json('tacticDb.json', 8)
+threat_db = load_json('threatDb.json', 5)
+vulnerabilitie_db = load_json('vulnerabilitieDb.json', 6)
+
+dbs = {
+    14: outcomes_db,
+    12: protection_measure_db,
+    8: tactic_db,
+    5: threat_db,
+    6: vulnerabilitie_db
+}
+
+DTO_TYPE_TO_CONFIG = {
+    14: {'field': 'TechnologyId', 'function': get_top_n_outcomes},
+    12: {'field': 'ProtectionMeasureId', 'function': get_top_n_for_category},
+    8: {'field': 'TacticId', 'function': get_top_n_tactics},
+    5: {'field': 'ThreadId', 'function': get_top_n_for_category},
+    6: {'field': 'VulnerabilitieId', 'function': get_top_n_for_category}
+}
+
+@app.route('/Matcher', methods=['POST'])
+def Matcher():
+    global model, model_type
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': 'Отсутствуют данные JSON'}), 400
+
+        textDescription = data.get('TextDescription')
+        modelName = data.get('ModelName')
+        filteringCvss = data.get('FilteringCvss')
+        top_n = data.get('TopN', 10)
+
+        if textDescription is None or modelName is None or filteringCvss is None:
+            return jsonify({'error': 'Недостаточно параметров'}), 400
+
+        textDescription = str(textDescription).strip()
+        modelName = str(modelName).lower()
+        filteringCvss = bool(filteringCvss)
+        top_n = int(top_n)
+
+        if not textDescription or textDescription.isspace():
+            print(f"Ошибка: входной текст пустой или содержит только пробелы: '{textDescription}'")
+            return jsonify([])
+
+        if modelName not in ["word2vec", "fasttext"]:
+            return jsonify({'error': f"Недопустимое имя модели: {modelName}. Ожидается 'word2vec' или 'fasttext'"}), 400
+
+        # Загружаем модель, если она еще не загружена или отличается
+        if model is None or model_type != modelName:
+            model = load_model(modelName)
+            if model is None:
+                return jsonify({'error': f'Модель {modelName} не загружена. Проверьте файл модели.'}), 500
+
+        start_time = time.time()
+        input_vector = get_sentence_vector(textDescription, model, modelName)
+        if not np.any(input_vector):
+            print(f"Входной текст '{textDescription}' не распознан моделью {modelName}")
+            return jsonify([])
+
+        input_norm = np.linalg.norm(input_vector)
+        if input_norm == 0:
+            print(f"Нулевой вектор для текста '{textDescription}'")
+            return jsonify([])
+
+        category_results = {}
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(DTO_TYPE_TO_CONFIG), 4)) as executor:
+            future_to_dto = {}
+            for dto_type, config in DTO_TYPE_TO_CONFIG.items():
+                if dto_type in dbs:
+                    future = executor.submit(
+                        config['function'], 
+                        dbs[dto_type], 
+                        input_vector, 
+                        input_norm,
+                        model,
+                        modelName,
+                        top_n
+                    )
+                    future_to_dto[future] = (dto_type, config['field'])
+            
+            for future in concurrent.futures.as_completed(future_to_dto):
+                dto_type, field = future_to_dto[future]
+                try:
+                    top_results = future.result()
+                    category_results[field] = top_results
+                    print(f"Завершена обработка {field}, найдено {len(top_results)} результатов")
+                except Exception as e:
+                    print(f"Ошибка при обработке {field}: {e}")
+                    category_results[field] = [(0.0, None)] * top_n
+
+        response = []
+        
+        for i in range(top_n):
+            similarities = []
+            response_item = {}
+            
+            for field in ['ProtectionMeasureId', 'TacticId', 'TechnologyId', 'ThreadId', 'VulnerabilitieId']:
+                field_results = category_results.get(field, [])
+                
+                if i < len(field_results):
+                    similarity, guid_id = field_results[i]
+                    response_item[field] = guid_id
+                    if similarity > 0:
+                        similarities.append(similarity)
+                else:
+                    response_item[field] = None
+            
+            if similarities:
+                coefficient = sum(similarities) / len(similarities)
+            else:
+                coefficient = 0.0
+                
+            response_item['Coefficient'] = coefficient
+            response.append(response_item)
+
+        processing_time = time.time() - start_time
+        print(f"Общее время обработки: {processing_time:.3f} секунд")
+        print(f"Сформировано {len(response)} объектов ответа")
+      
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"Ошибка сервера: {e}")
+        return jsonify({'error': f'Внутренняя ошибка сервера: {str(e)}'}), 500
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=True, threaded=True)
