@@ -1,0 +1,834 @@
+import os
+import json
+import re
+import time
+import threading
+import heapq
+import concurrent.futures
+import numpy as np
+from flask import Flask, request, jsonify
+from typing import List, Dict, Any
+import gensim.models.word2vec
+import gensim.models.fasttext
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+import pymorphy3
+
+# ==============================
+# КОНСТАНТЫ МОДЕЛЕЙ И АЛГОРИТМОВ
+# ==============================
+
+# Названия моделей и алгоритмов
+MODEL_WORD2VEC = "wordtwovec"
+MODEL_FASTTEXT = "fasttext"
+MODEL_TFIDF = "tfidf"
+
+# Доступные алгоритмы для использования
+AVAILABLE_MODELS = [MODEL_WORD2VEC, MODEL_FASTTEXT, MODEL_TFIDF]
+
+# Настройки по умолчанию
+DEFAULT_MODEL = MODEL_TFIDF
+DEFAULT_TOP_N = 10
+
+# Названия полей в базе данных (для удобства изменения)
+FIELD_THREAD = 'ThreadId'
+FIELD_VULNERABILITY = 'VulnerabilitieId'
+FIELD_TACTIC = 'TacticId'
+FIELD_PROTECTION_MEASURE = 'ProtectionMeasureId'
+FIELD_TECHNOLOGY = 'TechnologyId'
+
+# Типы DTO и их соответствие функциям обработки
+DTO_TYPE_TO_CONFIG = {
+    14: {'field': FIELD_TECHNOLOGY, 'function': 'get_top_n_outcomes'},
+    12: {'field': FIELD_PROTECTION_MEASURE, 'function': 'get_top_n_for_category'},
+    8: {'field': FIELD_TACTIC, 'function': 'get_top_n_tactics'},
+    5: {'field': FIELD_THREAD, 'function': 'get_top_n_for_category'},
+    6: {'field': FIELD_VULNERABILITY, 'function': 'get_top_n_for_category'}
+}
+
+# Названия файлов баз данных
+DB_FILES = {
+    "Thread": "threatDb.json",
+    "Vulnerability": "vulnerabilitieDb.json",
+    "Tactic": "tacticDb.json",
+    "ProtectionMeasure": "protectionMeasureDb.json",
+    "Technology": "outcomesDb.json"
+}
+
+# Параметры токенизации
+TOKENIZE_MIN_LENGTH = 2
+TOKENIZE_NGRAM_RANGE = (1, 3)
+TOKENIZE_MAX_FEATURES = 10000
+
+# Параметры моделей (теперь используются как значения по умолчанию)
+WORD2VEC_VECTOR_SIZE = 300
+WORD2VEC_WINDOW = 5
+WORD2VEC_MIN_COUNT = 2
+WORD2VEC_EPOCHS = 10
+
+FASTTEXT_VECTOR_SIZE = 300
+FASTTEXT_WINDOW = 5
+FASTTEXT_MIN_COUNT = 2
+FASTTEXT_EPOCHS = 10
+
+# ==============================
+# КОНЕЦ КОНСТАНТ
+# ==============================
+
+# Обработка загрузки NLTK данных
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    from nltk.tokenize import word_tokenize
+    from nltk.corpus import stopwords
+    nltk_available = True
+except Exception as e:
+    print(f"⚠️ NLTK не доступен: {e}. Используем упрощенную токенизацию.")
+    nltk_available = False
+
+    # Простая замена функций NLTK
+    def word_tokenize(text):
+        return re.findall(r'\b\w+\b', text.lower())
+
+    class StopwordsFallback:
+        def words(self, language):
+            return set([
+                'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 'все', 'она',
+                'так', 'его', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 'ее', 'мне',
+                'было', 'вот', 'от', 'меня', 'еще', 'нет', 'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ну',
+                'вдруг', 'ли', 'если', 'уже', 'или', 'ни', 'быть', 'был', 'него', 'до', 'вас', 'нибудь', 'опять',
+                'уж', 'вам', 'сказал', 'ведь', 'там', 'потом', 'себя', 'ничего', 'ей', 'может', 'они', 'тут',
+                'где', 'есть', 'надо', 'ней', 'для', 'мы', 'тебя', 'их', 'чем', 'была', 'сам', 'чтоб', 'без',
+                'будто', 'чего', 'раз', 'тоже', 'себе', 'под', 'будет', 'ж', 'тогда', 'кто', 'этот', 'того',
+                'потому', 'этого', 'какой', 'совсем', 'ним', 'здесь', 'этом', 'один', 'почти', 'мой', 'тем',
+                'чтобы', 'нее', 'сейчас', 'были', 'куда', 'зачем', 'всех', 'никогда', 'можно', 'при', 'наконец',
+                'два', 'об', 'другой', 'хоть', 'после', 'над', 'больше', 'тот', 'через', 'эти', 'нас', 'про',
+                'всего', 'них', 'какая', 'много', 'разве', 'три', 'эту', 'моя', 'впрочем', 'хорошо', 'свою',
+                'этой', 'перед', 'иногда', 'лучше', 'чуть', 'том', 'нельзя', 'такой', 'им', 'более', 'всегда',
+                'конечно', 'всю', 'между'
+            ])
+
+    stopwords = StopwordsFallback()
+
+app = Flask(__name__)
+
+# Настройка Flask на форматированный JSON
+app.json.ensure_ascii = False
+app.json.sort_keys = False
+app.json.compact = False
+app.json.indent = 2
+
+# Конфигурация путей
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_DIR = os.path.join(SCRIPT_DIR, 'Database')
+MODELS_DIR = os.path.join(SCRIPT_DIR, 'Models')
+
+# Создаем папку Models если её нет
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# Глобальные переменные для кэширования и модели
+description_vector_cache = {}
+cache_lock = threading.Lock()
+model = None
+model_type = None
+model_vector_size = None  # Новое поле для хранения размерности модели
+use_pos_tags = False
+
+# Инициализация морфологического анализатора
+try:
+    morph = pymorphy3.MorphAnalyzer()
+    morph_available = True
+except Exception as e:
+    print(f"⚠️ Pymorphy3 не доступен: {e}. Используем упрощенную обработку.")
+    morph = None
+    morph_available = False
+
+# Стоп-слова
+try:
+    stop_words = set(stopwords.words('russian')) | {'быть', 'это', 'такой', 'который', 'все', 'этот'}
+except:
+    stop_words = StopwordsFallback().words('russian')
+
+# TF-IDF структуры
+db_vectors = {}
+db_documents = {}
+db_guids = {}
+db_sources = {}
+
+# Базы данных для Word2Vec/FastText
+dbs = {}
+
+# Загрузка модели Word2Vec или FastText
+def load_model(model_path, model_name):
+    global model, model_type, model_vector_size, use_pos_tags
+    
+    if not os.path.exists(model_path):
+        print(f"❌ Файл модели не найден: {model_path}")
+        return None
+    
+    if model is not None and model_type == model_name and hasattr(model, 'filename') and model.filename == model_path:
+        return model
+
+    try:
+        if model_name == MODEL_WORD2VEC:
+            print(f"🔄 Попытка загрузки Word2Vec модели из {model_path}")
+            try:
+                model = gensim.models.KeyedVectors.load_word2vec_format(model_path, binary=True)
+                model_vector_size = model.vector_size
+                print(f"✅ Модель Word2Vec успешно загружена (бинарный формат), размерность: {model_vector_size}")
+            except Exception as e:
+                print(f"⚠️ Не удалось загрузить как бинарный Word2Vec: {e}")
+                try:
+                    model = gensim.models.KeyedVectors.load_word2vec_format(model_path, binary=False)
+                    model_vector_size = model.vector_size
+                    print(f"✅ Модель Word2Vec успешно загружена (текстовый формат), размерность: {model_vector_size}")
+                except Exception as e:
+                    print(f"⚠️ Не удалось загрузить как текстовый Word2Vec: {e}")
+                    try:
+                        model = gensim.models.Word2Vec.load(model_path)
+                        model_vector_size = model.wv.vector_size
+                        print(f"✅ Модель Word2Vec успешно загружена (Gensim формат), размерность: {model_vector_size}")
+                    except Exception as e:
+                        print(f"❌ Не удалось загрузить как Gensim Word2Vec: {e}")
+                        return None
+            
+            if model:
+                use_pos_tags = any('_' in key for key in list(model.key_to_index.keys())[:100])
+                print(f"ℹ️ Модель Word2Vec использует POS-тэги: {use_pos_tags}")
+                
+        elif model_name == MODEL_FASTTEXT:
+            print(f"🔄 Попытка загрузки FastText модели из {model_path}")
+            try:
+                model = gensim.models.fasttext.load_facebook_vectors(model_path)
+                model_vector_size = model.vector_size
+                print(f"✅ Модель FastText успешно загружена через gensim, размерность: {model_vector_size}")
+            except Exception as e:
+                print(f"⚠️ Не удалось загрузить FastText через gensim: {e}")
+                try:
+                    model = gensim.models.KeyedVectors.load_word2vec_format(model_path, binary=True)
+                    model_vector_size = model.vector_size
+                    print(f"✅ Модель FastText загружена как Word2Vec формат, размерность: {model_vector_size}")
+                except Exception as e:
+                    print(f"❌ Не удалось загрузить FastText: {e}")
+                    return None
+        else:
+            print(f"❌ Неизвестное имя модели '{model_name}'")
+            return None
+
+        model.filename = model_path
+        model_type = model_name
+        return model
+        
+    except Exception as e:
+        print(f"❌ Критическая ошибка при загрузке модели: {e}")
+        return None
+
+# Загрузка JSON файлов
+def load_json(file_name, dto_type):
+    file_path = os.path.join(DATABASE_DIR, file_name)
+    try:
+        if not os.path.exists(file_path):
+            print(f"❌ Файл {file_path} не найден")
+            return {"DtoType": dto_type, "Value": []}
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            print(f"✅ Файл {file_name} успешно загружен")
+            return data
+    except json.JSONDecodeError as e:
+        print(f"❌ Ошибка: файл {file_path} не является валидным JSON - {e}")
+        return {"DtoType": dto_type, "Value": []}
+    except Exception as e:
+        print(f"❌ Ошибка загрузки {file_path}: {e}")
+        return {"DtoType": dto_type, "Value": []}
+
+# Упрощенная токенизация
+def simple_tokenize(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    words = re.findall(r'\b\w+\b', text)
+    return [word for word in words if word not in stop_words]
+
+# Получение вектора предложения для Word2Vec/FastText
+def get_sentence_vector(text, model, model_name):
+    if model is None:
+        # Используем сохраненную размерность модели или значение по умолчанию
+        vector_size = model_vector_size if model_vector_size is not None else WORD2VEC_VECTOR_SIZE
+        return np.zeros(vector_size)
+    
+    cache_key = f"{text}_{model_name}"
+    
+    with cache_lock:
+        if cache_key in description_vector_cache:
+            return description_vector_cache[cache_key]
+    
+    vectors = []
+    
+    if model_name == MODEL_WORD2VEC:
+        words = simple_tokenize(text)
+        for word in words:
+            if morph_available and morph:
+                try:
+                    parsed = morph.parse(word)[0]
+                    normal_form = parsed.normal_form
+                    for word_form in [word, normal_form]:
+                        if word_form in model:
+                            vectors.append(model[word_form])
+                            break
+                    if use_pos_tags and morph_available:
+                        pos = parsed.tag.POS
+                        if pos:
+                            pos_map = {
+                                'NOUN': 'NOUN', 'VERB': 'VERB', 'ADJF': 'ADJ', 'ADJS': 'ADJ',
+                                'ADVB': 'ADV', 'INFN': 'VERB', 'PRTF': 'ADJ', 'PRTS': 'ADJ'
+                            }
+                            pos_suffix = pos_map.get(pos, '')
+                            if pos_suffix:
+                                word_with_pos = f"{normal_form}_{pos_suffix}"
+                                if word_with_pos in model:
+                                    vectors.append(model[word_with_pos])
+                except Exception as e:
+                    if word in model:
+                        vectors.append(model[word])
+            else:
+                if word in model:
+                    vectors.append(model[word])
+                    
+    else:  # FastText
+        words = text.split()
+        for word in words:
+            word_clean = re.sub(r'[^\w]', '', word.lower())
+            if word_clean and word_clean in model:
+                vectors.append(model[word_clean])
+    
+    if not vectors:
+        # Используем сохраненную размерность модели или значение по умолчанию
+        vector_size = model_vector_size if model_vector_size is not None else WORD2VEC_VECTOR_SIZE
+        vector = np.zeros(vector_size)
+    else:
+        vector = np.mean(vectors, axis=0)
+    
+    with cache_lock:
+        description_vector_cache[cache_key] = vector
+    
+    return vector
+
+# Функции для Word2Vec/FastText
+def get_top_n_for_category(db_data, input_vector, input_norm, model, model_name, n=DEFAULT_TOP_N):
+    value = db_data.get('Value', [])
+    if not value:
+        return []
+
+    top_results = []
+    
+    for item in value:
+        desc = item.get('Description', '')
+        if not desc:
+            continue
+            
+        desc_vector = get_sentence_vector(desc, model, model_name)
+        
+        if np.any(desc_vector):
+            desc_norm = np.linalg.norm(desc_vector)
+            if desc_norm > 0:
+                dot_product = np.dot(input_vector, desc_vector)
+                similarity = dot_product / (input_norm * desc_norm)
+                
+                if len(top_results) < n:
+                    heapq.heappush(top_results, (similarity, item.get('GuidId')))
+                else:
+                    if similarity > top_results[0][0]:
+                        heapq.heapreplace(top_results, (similarity, item.get('GuidId')))
+
+    top_results.sort(key=lambda x: x[0], reverse=True)
+    return top_results
+
+def get_top_n_outcomes(db_data, input_vector, input_norm, model, model_name, n=DEFAULT_TOP_N):
+    value = db_data.get('Value', {})
+    techns = value.get('Technologys', [])
+    if not techns:
+        return []
+
+    top_results = []
+    
+    for item in techns:
+        desc = item.get('Description', '')
+        if not desc:
+            continue
+            
+        desc_vector = get_sentence_vector(desc, model, model_name)
+        
+        if np.any(desc_vector):
+            desc_norm = np.linalg.norm(desc_vector)
+            if desc_norm > 0:
+                dot_product = np.dot(input_vector, desc_vector)
+                similarity = dot_product / (input_norm * desc_norm)
+                
+                if len(top_results) < n:
+                    heapq.heappush(top_results, (similarity, item.get('GuidId')))
+                else:
+                    if similarity > top_results[0][0]:
+                        heapq.heapreplace(top_results, (similarity, item.get('GuidId')))
+
+    top_results.sort(key=lambda x: x[0], reverse=True)
+    return top_results
+
+def get_top_n_tactics(db_data, input_vector, input_norm, model, model_name, n=10):
+    value = db_data.get('Value', [])
+    if not value:
+        return []
+
+    top_results = []
+    
+    for item in value:
+        similarities = []  # Список сходств для тактики и её техник
+        
+        # Обработка описания тактики
+        desc = item.get('Description', '')
+        if desc:
+            desc_vector = get_sentence_vector(desc, model, model_name)
+            if np.any(desc_vector):
+                desc_norm = np.linalg.norm(desc_vector)
+                if desc_norm > 0:
+                    dot_product = np.dot(input_vector, desc_vector)
+                    similarity = dot_product / (input_norm * desc_norm)
+                    similarities.append(similarity)
+        
+        # Обработка описаний техник
+        for tech in item.get('Techniques', []):
+            desc = tech.get('Description', '')
+            if desc:
+                desc_vector = get_sentence_vector(desc, model, model_name)
+                if np.any(desc_vector):
+                    desc_norm = np.linalg.norm(desc_vector)
+                    if desc_norm > 0:
+                        dot_product = np.dot(input_vector, desc_vector)
+                        similarity = dot_product / (input_norm * desc_norm)
+                        similarities.append(similarity)
+        
+        # Если есть сходства, вычисляем общий коэффициент (среднее)
+        if similarities:
+            overall_similarity = sum(similarities) / len(similarities)
+            top_results.append((overall_similarity, item.get('GuidId')))
+        else:
+            # Если нет описаний, пропускаем или присваиваем 0
+            continue
+
+    # Сортируем по убыванию общего сходства и берём топ-N
+    top_results.sort(key=lambda x: x[0], reverse=True)
+    return top_results[:n]
+
+# Функции для TF-IDF
+def load_entities_from_json(filename: str, db_key: str):
+    """Загрузка сущностей из JSON файла для TF-IDF"""
+    entities = []
+    file_path = os.path.join(DATABASE_DIR, filename)
+
+    if not os.path.exists(file_path):
+        print(f"❌ Файл {filename} не найден!")
+        return [], [], []
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"❌ Ошибка чтения {filename}: {e}")
+        return [], [], []
+
+    def traverse(obj):
+        if isinstance(obj, dict):
+            guid = obj.get("GuidId", "").strip()
+            desc = obj.get("Description", "").strip()
+            if guid and desc:
+                entities.append((guid, desc))
+            for v in obj.values():
+                traverse(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                traverse(item)
+
+    traverse(data)
+    guids = [item[0] for item in entities]
+    texts = [item[1] for item in entities]
+    sources = [filename] * len(guids)
+    return texts, guids, sources
+
+def initialize_databases():
+    """Единая функция инициализации всех баз данных"""
+    global dbs
+    
+    print("🔄 Инициализация всех баз данных...")
+    
+    # Загрузка баз данных для Word2Vec/FastText
+    print("📊 Загрузка структурных данных...")
+    outcomes_db = load_json('outcomesDb.json', 14)
+    protection_measure_db = load_json('protectionMeasureDb.json', 12)
+    tactic_db = load_json('tacticDb.json', 8)
+    threat_db = load_json('threatDb.json', 5)
+    vulnerabilitie_db = load_json('vulnerabilitieDb.json', 6)
+
+    dbs = {
+        14: outcomes_db,
+        12: protection_measure_db,
+        8: tactic_db,
+        5: threat_db,
+        6: vulnerabilitie_db
+    }
+    
+    # Инициализация TF-IDF баз данных
+    print("🔤 Инициализация TF-IDF векторizers...")
+    for db_key, filename in DB_FILES.items():
+        print(f"🔍 Обработка {db_key} из {filename}...")
+        docs, guids, sources = load_entities_from_json(filename, db_key)
+        if not docs:
+            print(f"⚠️ В {filename} не найдено ни одного описания.")
+            continue
+
+        vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words=None,
+            token_pattern=r'[а-яА-ЯёЁa-zA-Z]{2,}',
+            ngram_range=TOKENIZE_NGRAM_RANGE,
+            max_features=TOKENIZE_MAX_FEATURES
+        )
+        vectorizer.fit(docs)
+
+        db_documents[db_key] = docs
+        db_guids[db_key] = guids
+        db_sources[db_key] = sources
+        db_vectors[db_key] = vectorizer
+
+        print(f"✅ Загружено {len(docs)} описаний для {db_key}")
+    
+    print("✅ Все базы данных успешно инициализированы")
+
+def find_top_n_matches_tfidf(query: str, db_key: str, n: int = DEFAULT_TOP_N) -> List[Dict[str, Any]]:
+    if db_key not in db_vectors:
+        return []
+
+    vectorizer = db_vectors[db_key]
+    documents = db_documents[db_key]
+    guids = db_guids[db_key]
+
+    query_tfidf = vectorizer.transform([query])
+    tfidf_matrix = vectorizer.transform(documents)
+    similarities = cosine_similarity(query_tfidf, tfidf_matrix).flatten()
+
+    matches = [
+        {"similarity": float(sim), "GuidId": guid}
+        for sim, guid in zip(similarities, guids)
+    ]
+
+    matches.sort(key=lambda x: x["similarity"], reverse=True)
+    return matches[:n]
+
+# Создаем словарь функций для удобного доступа
+FUNCTION_MAP = {
+    'get_top_n_for_category': get_top_n_for_category,
+    'get_top_n_outcomes': get_top_n_outcomes,
+    'get_top_n_tactics': get_top_n_tactics
+}
+
+# ЕДИНОРАЗОВАЯ ИНИЦИАЛИЗАЦИЯ БАЗ ДАННЫХ
+initialize_databases()
+
+@app.route('/Matcher', methods=['POST'])
+@app.route('/Matcher', methods=['POST'])
+def matcher():
+    global model, model_type, model_vector_size
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Отсутствуют данные JSON'}), 400
+
+        text_description = data.get('TextDescription') or data.get('query')
+        model_name = data.get('ModelName')
+        used_model_path = data.get('UsedModel')
+        filtering_cvss = data.get('FilteringCvss', False)
+
+        if text_description is None or model_name is None:
+            return jsonify({'error': 'Недостаточно параметров (TextDescription/query и ModelName обязательны)'}), 400
+
+        text_description = str(text_description).strip()
+        model_name = str(model_name).lower()
+        filtering_cvss = bool(filtering_cvss)
+
+        if not text_description or text_description.isspace():
+            print(f"❌ Ошибка: входной текст пустой или содержит только пробелы: '{text_description}'")
+            return jsonify({'error': 'Входной текст пустой или содержит только пробелы'}), 400
+
+        if model_name not in AVAILABLE_MODELS:
+            return jsonify({'error': f"Недопустимое имя модели: {model_name}. Ожидается {', '.join(AVAILABLE_MODELS)}"}), 400
+
+        start_time = time.time()
+
+        # Для TF-IDF игнорируем UsedModel, если он пустой
+        if model_name == MODEL_TFIDF:
+            if used_model_path:
+                print(f"ℹ️ Для TF-IDF модели параметр UsedModel игнорируется: {used_model_path}")
+            
+            top_results = {}
+            for db_key in DB_FILES.keys():
+                if db_key == "Tactic":
+                    # Специальная обработка для тактик
+                    tactic_db = dbs[8]
+                    vectorizer = db_vectors.get(db_key)
+                    if vectorizer:
+                        matches = get_top_n_tactics_tfidf(text_description, tactic_db, vectorizer, DEFAULT_TOP_N)
+                    else:
+                        matches = [(0.0, None)] * DEFAULT_TOP_N
+                    # Преобразуем в формат {"similarity": sim, "GuidId": guid}
+                    top_results[db_key] = [{"similarity": sim, "GuidId": guid} for sim, guid in matches]
+                else:
+                    matches = find_top_n_matches_tfidf(text_description, db_key, DEFAULT_TOP_N)
+                    if not matches:
+                        matches = [{"similarity": 0.0, "GuidId": None}] * DEFAULT_TOP_N
+                    top_results[db_key] = matches
+
+        elif model_name in [MODEL_WORD2VEC, MODEL_FASTTEXT]:
+            if not used_model_path:
+                return jsonify({'error': 'Для word2vec/fasttext необходимо указать UsedModel - путь к файлу модели'}), 400
+            
+            if model is None or model_type != model_name or (hasattr(model, 'filename') and model.filename != used_model_path):
+                model = load_model(used_model_path, model_name)
+                if model is None:
+                    return jsonify({'error': f'Модель {model_name} не загружена. Проверьте файл модели: {used_model_path}'}), 500
+
+            input_vector = get_sentence_vector(text_description, model, model_name)
+            if not np.any(input_vector):
+                print(f"⚠️ Входной текст '{text_description}' не распознан моделью {model_name}")
+                return jsonify({'error': f'Описание не распознано моделью {model_name}'}), 500
+
+            input_norm = np.linalg.norm(input_vector)
+            if input_norm == 0:
+                print(f"⚠️ Нулевой вектор для текста '{text_description}'")
+                return jsonify({'error': f'Описание не распознано моделью {model_name}'}), 500
+
+            category_results = {}
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(DTO_TYPE_TO_CONFIG), 4)) as executor:
+                future_to_dto = {}
+                for dto_type, config in DTO_TYPE_TO_CONFIG.items():
+                    if dto_type in dbs:
+                        function_name = config['function']
+                        function = FUNCTION_MAP.get(function_name)
+                        if function:
+                            future = executor.submit(
+                                function, 
+                                dbs[dto_type], 
+                                input_vector, 
+                                input_norm,
+                                model,
+                                model_name
+                            )
+                            future_to_dto[future] = (dto_type, config['field'])
+                
+                for future in concurrent.futures.as_completed(future_to_dto):
+                    dto_type, field = future_to_dto[future]
+                    try:
+                        top_results = future.result()
+                        category_results[field] = top_results
+                        print(f"✅ Завершена обработка {field}, найдено {len(top_results)} результатов")
+                    except Exception as e:
+                        print(f"❌ Ошибка при обработке {field}: {e}")
+                        category_results[field] = [(0.0, None)] * DEFAULT_TOP_N
+        else:
+            return jsonify({'error': f'Неподдерживаемая модель: {model_name}'}), 400
+
+        response = []
+        
+        for i in range(DEFAULT_TOP_N):
+            similarities = []
+            response_item = {}
+            
+            field_mapping = {
+                'Thread': FIELD_THREAD,
+                'Vulnerability': FIELD_VULNERABILITY,
+                'Tactic': FIELD_TACTIC,
+                'ProtectionMeasure': FIELD_PROTECTION_MEASURE,
+                'Technology': FIELD_TECHNOLOGY
+            }
+            
+            print(f"🔍 Обработка позиции {i}:")
+            
+            for db_key, field_name in field_mapping.items():
+                if model_name == MODEL_TFIDF:
+                    field_results = top_results.get(db_key, [])
+                else:
+                    field_results = category_results.get(field_name, [])
+
+                if i < len(field_results):
+                    similarity = field_results[i]["similarity"] if model_name == MODEL_TFIDF else field_results[i][0]
+                    guid_id = field_results[i]["GuidId"] if model_name == MODEL_TFIDF else field_results[i][1]
+                    response_item[field_name] = guid_id
+                    
+                    # ОТЛАДКА: выводим все коэффициенты, даже нулевые
+                    print(f"   {field_name}: similarity = {similarity}, guid = {guid_id}")
+                    
+                    if similarity != 0:
+                        similarities.append(abs(similarity))
+                    else:
+                        print(f"   ⚠️ {field_name}: коэффициент {similarity} не добавлен (<= 0)")
+                else:
+                    response_item[field_name] = None
+                    print(f"   {field_name}: нет результатов")
+            
+            # ОТЛАДКА: информация о списке similarities
+            print(f"📊 similarities список: {similarities}")
+            print(f"📊 Длина similarities: {len(similarities)}")
+            
+            coefficient = sum(similarities) / len(similarities) if similarities  else 0.0
+            response_item['Coefficient'] = round(coefficient, 6)
+            
+            print(f"🎯 Итоговый коэффициент для позиции {i}: {coefficient}")
+            response.append(response_item)
+
+        # Проверка на нулевой коэффициент для всех результатов
+        all_coefficients_zero = all(item['Coefficient'] == 0.0 for item in response)
+        if all_coefficients_zero:
+            print(f"❌ Все коэффициенты равны 0 для описания: '{text_description}'")
+            return jsonify({'error': f'Описание не распознано моделью'}), 500
+
+        processing_time = time.time() - start_time
+        print(f"⏱️ Общее время обработки: {processing_time:.3f} секунд")
+        print(f"📊 Сформировано {len(response)} объектов ответа")
+      
+        return jsonify(response), 200
+
+    except Exception as e:
+        print(f"❌ Ошибка сервера: {e}")
+        return jsonify({'error': f'Внутренняя ошибка сервера: {str(e)}'}), 500
+
+import fasttext
+
+@app.route('/Train', methods=['POST'])
+def train_model():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Отсутствуют данные JSON'}), 400
+        
+        model_name = data.get('NameAlgorithm')
+        if not model_name:
+            return jsonify({'error': 'Не указано название модели (ModelName)'}), 400
+        
+        model_name = model_name.lower()
+        if model_name not in [MODEL_WORD2VEC, MODEL_FASTTEXT]:
+            return jsonify({'error': f'Недопустимое имя модели. Ожидается "{MODEL_WORD2VEC}" или "{MODEL_FASTTEXT}"'}), 400
+        
+        training_texts = []
+        
+        def collect_texts(data):
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    if isinstance(value, str) and key.lower() in ['description', 'name', 'title', 'methodname', 'usage', 'horizont', 'necessity', 'experience', 'сharacteristic', 'effort']:
+                        if value.strip() and len(value.strip()) > TOKENIZE_MIN_LENGTH:
+                            training_texts.append(value.strip())
+                    elif isinstance(value, (dict, list)):
+                        collect_texts(value)
+            elif isinstance(data, list):
+                for item in data:
+                    collect_texts(item)
+        
+        for filename in DB_FILES.values():
+            file_path = os.path.join(DATABASE_DIR, filename)
+            if os.path.exists(file_path):
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        db_data = json.load(f)
+                    collect_texts(db_data)
+                    print(f"✅ Обработан файл: {filename}, собрано {len(training_texts)} текстов")
+                except Exception as e:
+                    print(f"❌ Ошибка при обработке файла {filename}: {e}")
+        
+        if not training_texts:
+            return jsonify({'error': 'Не удалось собрать тексты для обучения из баз данных'}), 500
+        
+        temp_training_file = os.path.join(SCRIPT_DIR, 'fasttext_training_data.txt')
+        
+        try:
+            with open(temp_training_file, 'w', encoding='utf-8') as f:
+                for text in training_texts:
+                    cleaned_text = re.sub(r'\s+', ' ', text.strip())
+                    f.write(cleaned_text + '\n')
+            
+            print(f"📁 Создан временный файл для обучения: {temp_training_file}")
+            print(f"📊 Всего предложений для обучения: {len(training_texts)}")
+            
+            if model_name == MODEL_WORD2VEC:
+                tokenized_sentences = []
+                for text in training_texts:
+                    tokens = simple_tokenize(text)
+                    if tokens:
+                        tokenized_sentences.append(tokens)
+                
+                model = gensim.models.Word2Vec(
+                    sentences=tokenized_sentences,
+                    vector_size=WORD2VEC_VECTOR_SIZE,
+                    window=WORD2VEC_WINDOW,
+                    min_count=WORD2VEC_MIN_COUNT,
+                    workers=4,
+                    sg=1,
+                    epochs=WORD2VEC_EPOCHS
+                )
+                model_path = os.path.join(MODELS_DIR, 'trained_word2vec_model.bin')
+                model.wv.save_word2vec_format(model_path, binary=True)
+                print(f"💾 Word2Vec модель сохранена в: {model_path}")
+                
+            elif model_name == MODEL_FASTTEXT:
+                model_path = os.path.join(MODELS_DIR, 'trained_fasttext_model.bin')
+                
+                model = fasttext.train_unsupervised(
+                    input=temp_training_file,
+                    model='skipgram',
+                    dim=FASTTEXT_VECTOR_SIZE,
+                    ws=FASTTEXT_WINDOW,
+                    minCount=FASTTEXT_MIN_COUNT,
+                    epoch=FASTTEXT_EPOCHS,
+                    thread=4
+                )
+                
+                model.save_model(model_path)
+                print(f"💾 FastText модель сохранена в формате Facebook: {model_path}")
+            
+            response_data = {
+                'ModelPath': model_path
+            }
+            
+            return jsonify(response_data), 200
+            
+        finally:
+            if os.path.exists(temp_training_file):
+                os.remove(temp_training_file)
+                print(f"🗑️ Временный файл удален: {temp_training_file}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка при обучении модели: {e}")
+        return jsonify({'error': f'Ошибка при обучении модели: {str(e)}'}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Проверка состояния сервера"""
+    return jsonify({
+        "status": "healthy",
+        "nltk_available": nltk_available,
+        "morph_available": morph_available,
+        "model_loaded": model is not None,
+        "model_type": model_type,
+        "model_vector_size": model_vector_size,  # Добавляем информацию о размерности
+        "tfidf_initialized": bool(db_vectors),
+        "models_directory": MODELS_DIR,
+        "database_directory": DATABASE_DIR,
+        "available_models": AVAILABLE_MODELS,
+        "default_model": DEFAULT_MODEL
+    })
+
+if __name__ == '__main__':
+    print("🚀 Сервер запущен")
+    print(f"📊 NLTK доступен: {nltk_available}")
+    print(f"📊 Pymorphy3 доступен: {morph_available}")
+    print(f"📁 Папка баз данных: {DATABASE_DIR}")
+    print(f"📁 Папка моделей: {MODELS_DIR}")
+    print(f"🔧 Доступные модели: {', '.join(AVAILABLE_MODELS)}")
+    print(f"⚙️ Модель по умолчанию: {DEFAULT_MODEL}")
+    app.run(host='127.0.0.1', port=5000, debug=False, threaded=True)
