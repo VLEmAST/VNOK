@@ -1,0 +1,177 @@
+import re
+import json
+import pandas as pd
+from collections import defaultdict
+from datetime import datetime
+import sys
+import os
+
+def read_text_file(file_path):
+    """ЧИТАЕТ TXT ФАЙЛ"""
+    if not os.path.exists(file_path):
+        print(f"❌ Файл {file_path} НЕ НАЙДЕН!")
+        print("📝 Создаю пример log.txt...")
+        example_text = """192.168.1.100 ERROR at 2024-03-15 09:30:00
+MAC 08:00:27:5A:BC:D3 connected to Zabbix 6.4
+10.10.2.15 DNS failed Wireshark 4.2.1 at 11:20:15
+pfSense 2.7.0 blocked 00:50:56:AA:BB:CC on 16 марта 2024"""
+        with open("log.txt", "w", encoding="utf-8") as f:
+            f.write(example_text)
+        return example_text
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    print(f"📄 Прочитан файл: {len(text)} символов")
+    return text
+
+def extract_all_entities(text):
+    entities = defaultdict(list)
+    
+    # 🔴 IP-адреса
+    for match in re.finditer(r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b', text):
+        entities['IP'].append(match.group())
+    
+    # 🔵 MAC-адреса
+    for match in re.finditer(r'\b[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}\b', text):
+        entities['MAC'].append(match.group())
+    
+    # 🟢 ПО (расширенный список)
+    software_names = [
+        'Zabbix', 'pfSense', 'Snort', 'Wireshark', 'Nmap', 'Cain', 'Abel', 
+        'EternalBlue', 'Cisco IOS', 'Windows Server', 'Ubuntu Server', 
+        'Splunk', 'ARP-spoofing'
+    ]
+    words = re.findall(r'\b\w+\b', text)
+    for word in words:
+        for sw in software_names:
+            if sw.lower() in word.lower():
+                entities['SOFTWARE'].append(sw)
+    
+    # 🟡 ДАТЫ (русские + цифры)
+    for match in re.finditer(r'\b(\d{1,2}\s+(?:марта?|января|февраля|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})\b', text):
+        entities['DATE'].append(match.group())
+    for match in re.finditer(r'\b20\s?\d{2}\b', text):
+        entities['DATE'].append(match.group())
+    
+    # 🟣 ВРЕМЯ
+    for match in re.finditer(r'\b\d{2}:\d{2}:\d{2}\b', text):
+        entities['TIME'].append(match.group())
+    
+    # 🏢 ОРГАНИЗАЦИИ
+    for match in re.finditer(r'«([^»]+)»', text):
+        entities['ORG'].append(match.group(1))
+    
+    return {k: list(set(v)) for k, v in entities.items()}
+
+def save_all_reports(result, text, input_file):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 📊 1. ТАБЛИЦА (CSV + TXT)
+    df = pd.DataFrame([
+        {'Тип': k, 'Количество': len(v), 'Примеры': ', '.join(v[:2])}
+        for k, v in result.items()
+    ])
+    csv_name = f'ner_report_{os.path.splitext(os.path.basename(input_file))[0]}_{timestamp}.csv'
+    txt_name = f'ner_summary_{os.path.splitext(os.path.basename(input_file))[0]}_{timestamp}.txt'
+    
+    df.to_csv(csv_name, index=False, encoding='utf-8')
+    with open(txt_name, 'w', encoding='utf-8') as f:
+        f.write("🚀 ОТЧЕТ NER АНАЛИЗА\n")
+        f.write("="*50 + "\n\n")
+        f.write(df.to_string(index=False) + "\n\n")
+        f.write(f"📅 Создано: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n")
+        f.write(f"📄 Источник: {input_file}\n")
+    
+    # 💾 2. JSON
+    json_name = f'entities_{os.path.splitext(os.path.basename(input_file))[0]}_{timestamp}.json'
+    with open(json_name, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    
+    # 🎨 3. ЦВЕТНОЙ ТЕКСТ (HTML)
+    html_name = f'colored_{os.path.splitext(os.path.basename(input_file))[0]}_{timestamp}.html'
+    html_content = "<html><body><h1>🎯 ВЫДЕЛЕННЫЙ ТЕКСТ</h1><pre style='font-size:14px;'>"
+    sentences = re.split(r'[.!?]+', text)[:10]
+    for i, sent in enumerate(sentences, 1):
+        colored = sent
+        for entity_type, color in [
+            ('IP', 'red'), ('MAC', 'blue'), ('SOFTWARE', 'green'), 
+            ('DATE', 'orange'), ('TIME', 'purple'), ('ORG', 'brown')
+        ]:
+            pattern = '|'.join(re.escape(e) for e in result.get(entity_type, []))
+            if pattern:
+                colored = re.sub(
+                    f'\\b({pattern})\\b', 
+                    f'<span style="color:{color};font-weight:bold;">\\g<1></span>', 
+                    colored
+                )
+        html_content += f"<b>{i}.</b> {colored}<br>\n"
+    html_content += "</pre></body></html>"
+    with open(html_name, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    # 📄 4. ПОЛНЫЙ ОТЧЕТ (TXT)
+    full_name = f'full_report_{os.path.splitext(os.path.basename(input_file))[0]}_{timestamp}.txt'
+    full_report = f"""КИБЕРАТАКИ - ПОЛНЫЙ NER ОТЧЕТ
+{'='*60}
+📅 Дата анализа: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
+📄 Источник: {input_file}
+
+СУЩНОСТИ ({sum(len(v) for v in result.values())} всего):
+
+IP-АДРЕСА ({len(result.get('IP', []))}):
+{chr(10).join(f'• {ip}' for ip in result.get('IP', []))}
+
+MAC-АДРЕСА ({len(result.get('MAC', []))}):
+{chr(10).join(f'• {mac}' for mac in result.get('MAC', []))}
+
+ПРОГРАММЫ ({len(result.get('SOFTWARE', []))}):
+{chr(10).join(f'• {sw}' for sw in result.get('SOFTWARE', []))}
+
+ДАТЫ ({len(result.get('DATE', []))}):
+{chr(10).join(f'• {date}' for date in result.get('DATE', []))}
+
+ВРЕМЯ ({len(result.get('TIME', []))}):
+{chr(10).join(f'• {time}' for time in result.get('TIME', []))}
+
+ОРГАНИЗАЦИИ ({len(result.get('ORG', []))}):
+{chr(10).join(f'• {org}' for org in result.get('ORG', []))}
+"""
+    with open(full_name, 'w', encoding='utf-8') as f:
+        f.write(full_report)
+    
+    print(f"\n✅ СОЗДАНО 5 ФАЙЛОВ:")
+    print(f"   📊 {csv_name}")
+    print(f"   📝 {txt_name}")
+    print(f"   💾 {json_name}")
+    print(f"   🎨 {html_name}")
+    print(f"   📄 {full_name}")
+    return [csv_name, txt_name, json_name, html_name, full_name]
+
+# 🎯 ЗАПУСК!
+if __name__ == "__main__":
+    print("🚀 УЛЬТИМАТИВНЫЙ NER — TXT ФАЙЛ!")
+    print("=" * 60)
+    
+    # ЧИТАЕМ АРГУМЕНТ ИЛИ log.txt
+    if len(sys.argv) > 1:
+        file_path = sys.argv[1]
+    else:
+        file_path = "log.txt"
+    
+    # ЧИТАЕМ ТЕКСТ
+    TEXT = read_text_file(file_path)
+    
+    # АНАЛИЗ
+    result = extract_all_entities(TEXT)
+    
+    # СОХРАНЕНИЕ
+    files = save_all_reports(result, TEXT, file_path)
+    
+    # КРАТКИЙ ВЫВОД
+    df = pd.DataFrame([
+        {'Тип': k, 'Количество': len(v), 'Примеры': ', '.join(v[:2])}
+        for k, v in result.items()
+    ])
+    print("\n📈 КРАТКИЙ ОТЧЕТ:")
+    print(df.to_string(index=False))
+    print(f"\n🎉 АНАЛИЗ ЗАВЕРШЕН! {sum(len(v) for v in result.values())} сущностей!")
