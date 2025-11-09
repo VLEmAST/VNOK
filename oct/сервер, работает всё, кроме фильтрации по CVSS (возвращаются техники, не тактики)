@@ -1,1 +1,463 @@
+import os
+import json
+import re
+import time
+import threading
+import heapq
+import numpy as np
+from flask import Flask, request, jsonify
+import gensim.models.word2vec
+import gensim.models.fasttext
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+import pymorphy3
+import fasttext
+import sys
+import signal
 
+# ==============================
+# КОНСТАНТЫ МОДЕЛЕЙ
+# ==============================
+
+MODEL_WORD2VEC = "wordtwovec"
+MODEL_FASTTEXT = "fasttext"
+MODEL_TFIDF = "tfidf"
+
+AVAILABLE_MODELS = [MODEL_WORD2VEC, MODEL_FASTTEXT, MODEL_TFIDF]
+
+TOKENIZE_NGRAM_RANGE = (1, 3)
+TOKENIZE_MAX_FEATURES = 10000
+
+WORD2VEC_VECTOR_SIZE = 300
+FASTTEXT_VECTOR_SIZE = 300
+
+# ==============================
+# Flask App + Путь
+# ==============================
+
+app = Flask(__name__)
+app.json.ensure_ascii = False
+app.json.sort_keys = False
+app.json.compact = False
+app.json.indent = 2
+
+def get_application_path():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+SCRIPT_DIR = get_application_path()
+MODELS_DIR = os.path.join(SCRIPT_DIR, 'Models')
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# ==============================
+# Глобальные переменные
+# ==============================
+
+description_vector_cache = {}
+cache_lock = threading.Lock()
+model, model_type, model_vector_size = None, None, None
+use_pos_tags = False
+
+# ==============================
+# NLTK / pymorphy3
+# ==============================
+
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    from nltk.tokenize import word_tokenize
+    from nltk.corpus import stopwords
+    nltk_available = True
+except Exception as e:
+    print(f"NLTK не доступен: {e}. Используем упрощенную токенизацию.")
+    nltk_available = False
+    def word_tokenize(text):
+        return re.findall(r'\b\w+\b', text.lower())
+    class StopwordsFallback:
+        def words(self, language):
+            return set([
+                'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 'все', 'она',
+                'так', 'его', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 'ее', 'мне',
+                'было', 'вот', 'от', 'меня', 'еще', 'нет', 'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ну',
+                'вдруг', 'ли', 'если', 'уже', 'или', 'ни', 'быть', 'был', 'него', 'до', 'вас', 'нибудь', 'опять',
+                'уж', 'вам', 'сказал', 'ведь', 'там', 'потом', 'себя', 'ничего', 'ей', 'может', 'они', 'тут',
+                'где', 'есть', 'надо', 'ней', 'для', 'мы', 'тебя', 'их', 'чем', 'была', 'сам', 'чтоб', 'без',
+                'будто', 'чего', 'раз', 'тоже', 'себе', 'под', 'будет', 'ж', 'тогда', 'кто', 'этот', 'того',
+                'потому', 'этого', 'какой', 'совсем', 'ним', 'здесь', 'этом', 'один', 'почти', 'мой', 'тем',
+                'чтобы', 'нее', 'сейчас', 'были', 'куда', 'зачем', 'всех', 'никогда', 'можно', 'при', 'наконец',
+                'два', 'об', 'другой', 'хоть', 'после', 'над', 'больше', 'тот', 'через', 'эти', 'нас', 'про',
+                'всего', 'них', 'какая', 'много', 'разве', 'три', 'эту', 'моя', 'впрочем', 'хорошо', 'свою',
+                'этой', 'перед', 'иногда', 'лучше', 'чуть', 'том', 'нельзя', 'такой', 'им', 'более', 'всегда',
+                'конечно', 'всю', 'между'
+            ])
+    stopwords = StopwordsFallback()
+
+try:
+    morph = pymorphy3.MorphAnalyzer()
+    morph_available = True
+except Exception as e:
+    print(f"Pymorphy3 не доступен: {e}. Используем упрощенную обработку.")
+    morph = None
+    morph_available = False
+
+try:
+    stop_words = set(stopwords.words('russian')) | {'быть', 'это', 'такой', 'который', 'все', 'этот'}
+except:
+    stop_words = StopwordsFallback().words('russian')
+
+# ==============================
+# УТИЛИТЫ
+# ==============================
+
+def simple_tokenize(text: str):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    return [w for w in re.findall(r'\b\w+\b', text) if w not in stop_words]
+
+def load_model(model_path: str, model_name: str):
+    global model, model_type, model_vector_size, use_pos_tags
+
+    if not os.path.exists(model_path):
+        return None
+
+    if model and model_type == model_name and getattr(model, "filename", None) == model_path:
+        return model
+
+    try:
+        if model_name == MODEL_WORD2VEC:
+            model = gensim.models.KeyedVectors.load_word2vec_format(model_path, binary=True)
+        elif model_name == MODEL_FASTTEXT:
+            model = gensim.models.fasttext.load_facebook_vectors(model_path)
+        else:
+            return None
+        model_vector_size = model.vector_size
+        use_pos_tags = any('_' in k for k in list(model.key_to_index.keys())[:100])
+        model.filename = model_path
+        model_type = model_name
+        return model
+    except Exception as e:
+        print(f"Ошибка загрузки модели {model_path}: {e}")
+        return None
+
+def get_sentence_vector(text: str, model, model_name: str):
+    if model is None:
+        size = model_vector_size or WORD2VEC_VECTOR_SIZE
+        return np.zeros(size)
+
+    cache_key = f"{text}_{model_name}"
+    with cache_lock:
+        if cache_key in description_vector_cache:
+            return description_vector_cache[cache_key]
+
+    vectors = []
+    if model_name == MODEL_WORD2VEC:
+        words = simple_tokenize(text)
+        for w in words:
+            if morph_available and morph:
+                p = morph.parse(w)[0]
+                nf = p.normal_form
+                for form in (w, nf):
+                    if form in model:
+                        vectors.append(model[form])
+                        break
+                if use_pos_tags:
+                    pos = p.tag.POS
+                    if pos in ('NOUN','VERB','ADJF','ADJS','ADVB','INFN','PRTF','PRTS'):
+                        pos_map = {'NOUN':'NOUN','VERB':'VERB','ADJF':'ADJ','ADJS':'ADJ',
+                                   'ADVB':'ADV','INFN':'VERB','PRTF':'ADJ','PRTS':'ADJ'}
+                        tag = pos_map.get(pos,'')
+                        if tag:
+                            w_pos = f"{nf}_{tag}"
+                            if w_pos in model:
+                                vectors.append(model[w_pos])
+            elif w in model:
+                vectors.append(model[w])
+    else:  # FastText
+        for w in text.split():
+            wc = re.sub(r'[^\w]', '', w.lower())
+            if wc and wc in model:
+                vectors.append(model[wc])
+
+    vec = np.mean(vectors, axis=0) if vectors else np.zeros(model_vector_size or WORD2VEC_VECTOR_SIZE)
+    with cache_lock:
+        description_vector_cache[cache_key] = vec
+    return vec
+
+# ==============================
+# УЛУЧШЕННЫЙ ПАРСЕР (ТОЛЬКО ТЕХНИКИ И УГРОЗЫ)
+# ==============================
+
+def walk(obj):
+    res = []
+
+    if isinstance(obj, list):
+        for item in obj:
+            res.extend(walk(item))
+        return res
+
+    if isinstance(obj, dict):
+        # Это тактика? → пропускаем
+        has_techniques = 'Techniques' in obj and isinstance(obj['Techniques'], list) and len(obj['Techniques']) > 0
+
+        guid = obj.get('GuidId')
+        desc = obj.get('Description', '').strip()
+
+        # Берём ТОЛЬКО если это техника/угроза (НЕ тактика)
+        if guid and desc and not has_techniques:
+            res.append({
+                'GuidId': str(guid),
+                'Description': desc
+            })
+
+        # Рекурсия в Value
+        if 'Value' in obj:
+            res.extend(walk(obj['Value']))
+
+        # Рекурсия в Techniques
+        if 'Techniques' in obj and isinstance(obj['Techniques'], list):
+            for tech in obj['Techniques']:
+                res.extend(walk(tech))
+
+        # Остальные поля
+        for key, value in obj.items():
+            if key in ('Value', 'Techniques'):
+                continue
+            if isinstance(value, (dict, list)):
+                res.extend(walk(value))
+
+    return res
+
+# ==============================
+# СБОР ТЕКСТОВ ДЛЯ ОБУЧЕНИЯ (ТОЛЬКО ТЕХНИКИ/УГРОЗЫ)
+# ==============================
+
+def collect_training_texts():
+    training_texts = []
+    database_dir = os.path.join(SCRIPT_DIR, 'Database')
+    if not os.path.exists(database_dir):
+        return training_texts
+
+    def collect(obj):
+        if isinstance(obj, list):
+            for item in obj:
+                collect(item)
+            return
+
+        if isinstance(obj, dict):
+            has_techniques = 'Techniques' in obj and isinstance(obj['Techniques'], list) and len(obj['Techniques']) > 0
+            desc = obj.get('Description', '').strip()
+
+            if desc and len(desc) > 2 and not has_techniques:
+                training_texts.append(desc)
+
+            if 'Value' in obj:
+                collect(obj['Value'])
+            if 'Techniques' in obj and isinstance(obj['Techniques'], list):
+                for tech in obj['Techniques']:
+                    collect(tech)
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    collect(v)
+
+    for file in os.listdir(database_dir):
+        if file.endswith('.json'):
+            path = os.path.join(database_dir, file)
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    js = json.load(f)
+                collect(js)
+            except Exception as e:
+                print(f"Error reading {file}: {e}")
+    return training_texts
+
+# ==============================
+# РОУТЫ
+# ==============================
+
+@app.route('/Matcher', methods=['POST'])
+def matcher():
+    global model, model_type, model_vector_size  
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'JSON required'}), 400
+
+        text_desc   = (data.get('TextDescription') or data.get('query') or '').strip()
+        model_name  = data.get('ModelName', '').lower()
+        model_path  = data.get('UsedModel')
+        sources     = data.get('UsedSources', [])
+        filter_cvss = data.get('FilteringCvss', False)
+
+        if not text_desc:
+            return jsonify({'error': 'TextDescription required'}), 400
+        if model_name not in AVAILABLE_MODELS:
+            return jsonify({'error': f'ModelName must be one of {AVAILABLE_MODELS}'}), 400
+        if model_name in (MODEL_WORD2VEC, MODEL_FASTTEXT):
+            if not model_path or not os.path.exists(model_path) or not model_path.endswith('.bin'):
+                return jsonify({'error': 'Valid .bin UsedModel required'}), 400
+        if not sources or not isinstance(sources, list):
+            return jsonify({'error': 'UsedSources must be non-empty list'}), 400
+
+        db_entities = {}
+        for src in sources:      
+            full = os.path.join(SCRIPT_DIR, src.lstrip('/'))  
+            if not os.path.exists(full):
+                print(f"[WARN] Source not found: {full}")
+                continue
+            try:
+                with open(full, 'r', encoding='utf-8') as f:
+                    js = json.load(f)
+
+                items = walk(js)
+                
+                if items:
+                    db_entities[src] = items
+                    dto_type = js.get('DtoType', 'unknown')
+                    item_type = "techniques" if dto_type == 8 else "threats" if dto_type == 5 else "items"
+                    print(f"[INFO] Loaded {len(items)} {item_type} from {src} (DtoType={dto_type})")
+            except Exception as e:
+                print(f"[ERROR] Reading {full}: {e}")
+
+        if not db_entities:
+            return jsonify({'error': 'No valid data in any source'}), 400
+
+        # === Остальная логика без изменений ===
+        if model_name in (MODEL_WORD2VEC, MODEL_FASTTEXT):
+            if (model is None or model_type != model_name or
+                getattr(model, "filename", None) != model_path):
+                model = load_model(model_path, model_name)
+                if model is None:
+                    return jsonify({'error': f'Failed to load model {model_path}'}), 500
+            query_vec = get_sentence_vector(text_desc, model, model_name)
+            q_norm = np.linalg.norm(query_vec)
+            if q_norm == 0:
+                return jsonify({'error': 'Query not recognized'}), 500
+
+        db_top10 = {}
+        db_similarities = {}
+        for src, items in db_entities.items():
+            sims = []
+            if model_name == MODEL_TFIDF:
+                docs = [e['Description'] for e in items]
+                vectorizer = TfidfVectorizer(
+                    lowercase=True,
+                    token_pattern=r'[а-яА-ЯёЁa-zA-Z]{2,}',
+                    ngram_range=TOKENIZE_NGRAM_RANGE,
+                    max_features=TOKENIZE_MAX_FEATURES
+                )
+                tfidf = vectorizer.fit_transform(docs)
+                q_vec = vectorizer.transform([text_desc])
+                scores = cosine_similarity(q_vec, tfidf).flatten()
+                sims = [(float(s), e['GuidId']) for s, e in zip(scores, items)]
+            else:
+                for e in items:
+                    vec = get_sentence_vector(e['Description'], model, model_name)
+                    n = np.linalg.norm(vec)
+                    s = np.dot(query_vec, vec) / (q_norm * n) if n > 0 else 0.0
+                    sims.append((float(s), e['GuidId']))
+            sims.sort(key=lambda x: x[0], reverse=True)
+            db_top10[src] = [guid for _, guid in sims[:10]]
+            db_similarities[src] = [sim for sim, _ in sims[:10]]
+
+        matcher_objects = []
+        for rank in range(1, 11):
+            sources_dict = {}
+            similarities = []
+            for src, guids in db_top10.items():
+                if rank <= len(guids):
+                    guid = guids[rank - 1]
+                    sources_dict[guid] = src
+                    similarities.append(db_similarities[src][rank - 1])
+            if sources_dict:
+                avg_sim = sum(similarities) / len(similarities)
+                matcher_objects.append({
+                    "Coefficient": round(avg_sim, 4),
+                    "Sources": sources_dict
+                })
+
+        matcher_objects.sort(key=lambda x: x["Coefficient"], reverse=True)
+        result = {"MatcherObjects": matcher_objects}
+        print(f"[SUCCESS] Generated {len(matcher_objects)} MatcherObjects")
+        return jsonify(result), 200
+
+    except Exception as e:
+        import traceback
+        print(f"[FATAL] {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/Train', methods=['POST'])
+def train_model():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'JSON required'}), 400
+
+        model_name = data.get('NameAlgorithm', '').lower()
+        if model_name not in ['wordtwovec', 'fasttext']:
+            return jsonify({'error': f'NameAlgorithm must be wordtwovec or fasttext'}), 400
+
+        training_texts = collect_training_texts()
+        if not training_texts:
+            return jsonify({'error': 'No training texts found'}), 500
+
+        temp_file = os.path.join(SCRIPT_DIR, 'temp_train.txt')
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                for t in training_texts:
+                    f.write(re.sub(r'\s+', ' ', t) + '\n')
+
+            model_path = os.path.join(MODELS_DIR, f"trained_{model_name}_model.bin")
+
+            if model_name == 'wordtwovec':
+                sentences = [simple_tokenize(t) for t in training_texts if simple_tokenize(t)]
+                model_obj = gensim.models.Word2Vec(
+                    sentences=sentences,
+                    vector_size=WORD2VEC_VECTOR_SIZE,
+                    window=5, min_count=1, workers=4, epochs=10, sg=1
+                )
+                model_obj.wv.save_word2vec_format(model_path, binary=True)
+            else:
+                model_obj = fasttext.train_unsupervised(
+                    input=temp_file, model='skipgram', dim=FASTTEXT_VECTOR_SIZE,
+                    ws=5, epoch=10, thread=4, wordNgrams=3, minCount=1
+                )
+                model_obj.save_model(model_path)
+
+            return jsonify({'ModelPath': model_path}), 200
+        finally:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+    except Exception as e:
+        return jsonify({'error': f'Training failed: {str(e)}'}), 500
+
+@app.route('/Retrain', methods=['POST'])
+def retrain_model():
+    # ... (без изменений, если не нужно)
+    pass  # оставь как было
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "nltk_available": nltk_available,
+        "morph_available": morph_available,
+        "model_loaded": model is not None,
+        "model_type": model_type,
+        "available_models": AVAILABLE_MODELS,
+        "models_directory": MODELS_DIR,
+        "version": "v5.1 Final (Techniques Only)"
+    })
+
+@app.route('/Shutdown', methods=['POST'])
+def shutdown():
+    if request.remote_addr == '127.0.0.1':
+        os.kill(os.getpid(), signal.SIGINT)
+        return 'Сервер остановлен', 200
+    return 'Игнорирование', 403
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=False, threaded=True)
