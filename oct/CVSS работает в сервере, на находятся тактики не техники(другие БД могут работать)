@@ -1,0 +1,391 @@
+import os
+import json
+import re
+import threading
+import numpy as np
+from flask import Flask, request, jsonify
+import gensim.models.word2vec
+import gensim.models.fasttext
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+import pymorphy3
+import fasttext
+import sys
+import signal
+
+# ==============================
+# КОНСТАНТЫ
+# ==============================
+MODEL_WORD2VEC = "wordtwovec"
+MODEL_FASTTEXT = "fasttext"
+MODEL_TFIDF = "tfidf"
+AVAILABLE_MODELS = [MODEL_WORD2VEC, MODEL_FASTTEXT, MODEL_TFIDF]
+TOKENIZE_NGRAM_RANGE = (1, 3)
+TOKENIZE_MAX_FEATURES = 10000
+
+app = Flask(__name__)
+app.json.ensure_ascii = False
+app.json.compact = False
+app.json.indent = 2
+
+SCRIPT_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(SCRIPT_DIR, 'Models')
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# Глобальные
+description_vector_cache = {}
+cache_lock = threading.Lock()
+model, model_type = None, None
+
+# NLTK / pymorphy3
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    from nltk.corpus import stopwords
+    stop_words = set(stopwords.words('russian'))
+except:
+    stop_words = {'и', 'в', 'на', 'с', 'не', 'по', 'для', 'от', 'до', 'при', 'за', 'как', 'что', 'но', 'или', 'а', 'бы', 'же', 'это', 'все', 'он', 'она', 'они'}
+
+try:
+    morph = pymorphy3.MorphAnalyzer()
+    morph_available = True
+except:
+    morph = None
+    morph_available = False
+
+# ==============================
+# УТИЛИТЫ
+# ==============================
+def simple_tokenize(text: str):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    return [w for w in re.findall(r'\b\w+\b', text) if w not in stop_words]
+
+def load_model(path: str, name: str):
+    global model, model_type
+    if not os.path.exists(path): return None
+    if model and model_type == name and getattr(model, "filename", "") == path:
+        return model
+    try:
+        if name == MODEL_WORD2VEC:
+            model = gensim.models.KeyedVectors.load_word2vec_format(path, binary=True)
+        elif name == MODEL_FASTTEXT:
+            model = gensim.models.fasttext.load_facebook_vectors(path)
+        else:
+            return None
+        model.filename = path
+        model_type = name
+        return model
+    except Exception as e:
+        print(f"Model load error: {e}")
+        return None
+
+def get_sentence_vector(text: str, model, model_name: str):
+    if model is None: return np.zeros(300)
+    cache_key = f"{text}_{model_name}"
+    with cache_lock:
+        if cache_key in description_vector_cache:
+            return description_vector_cache[cache_key]
+    vectors = []
+    if model_name == MODEL_WORD2VEC:
+        words = simple_tokenize(text)
+        for w in words:
+            if morph_available:
+                p = morph.parse(w)[0]
+                nf = p.normal_form
+                for form in (w, nf):
+                    if form in model:
+                        vectors.append(model[form])
+                        break
+            elif w in model:
+                vectors.append(model[w])
+    else:
+        for w in text.split():
+            wc = re.sub(r'[^\w]', '', w.lower())
+            if wc and wc in model:
+                vectors.append(model[wc])
+    vec = np.mean(vectors, axis=0) if vectors else np.zeros(300)
+    with cache_lock:
+        description_vector_cache[cache_key] = vec
+    return vec
+
+# ==============================
+# CVSS ПАРСЕР
+# ==============================
+def parse_cvss(vector: str):
+    if not vector or not isinstance(vector, str): return {}
+    return dict(part.split(':') for part in vector.split('/') if ':' in part)
+
+# ==============================
+# УМНЫЙ ПАРСЕР — БЕЗ DtoType
+# ==============================
+def walk(obj, source_file=None):
+    res = []
+    if isinstance(obj, list):
+        for item in obj:
+            res.extend(walk(item, source_file))
+        return res
+    if isinstance(obj, dict):
+        guid = obj.get('GuidId') or obj.get('id') or obj.get('ID')
+        desc = obj.get('Description') or obj.get('description') or ''
+        desc = desc.strip()
+
+        if guid and desc:
+            item = {
+                'GuidId': str(guid),
+                'Description': desc,
+                'SourceFile': source_file
+            }
+
+            # ОПРЕДЕЛЯЕМ ТИП ПО ПОЛЯМ
+            p = obj.get('PrivacyViolation')
+            i = obj.get('IntegrityViolation')
+            a = obj.get('AccessibilityViolation')
+            if all(x in obj for x in ['PrivacyViolation', 'IntegrityViolation', 'AccessibilityViolation']):
+                item.update({
+                    'IsThreat': True,
+                    'PrivacyViolation': str(p or '0'),
+                    'IntegrityViolation': str(i or '0'),
+                    'AccessibilityViolation': str(a or '0')
+                })
+
+            cvss = obj.get('CvssTwo') or obj.get('CVSS2') or obj.get('CvssThree') or obj.get('CVSS')
+            if cvss and isinstance(cvss, str):
+                item.update({
+                    'IsVulnerability': True,
+                    'CvssTwo': cvss,
+                    'CvssParsed': parse_cvss(cvss)
+                })
+
+            res.append(item)
+
+        # Рекурсия
+        for key, value in obj.items():
+            if key in ('Value', 'Techniques', 'techniques', 'value'): continue
+            if isinstance(value, (dict, list)):
+                res.extend(walk(value, source_file))
+        if 'Value' in obj:
+            res.extend(walk(obj['Value'], source_file))
+        if 'Techniques' in obj:
+            res.extend(walk(obj['Techniques'], source_file))
+    return res
+
+# ==============================
+# /Matcher
+# ==============================
+@app.route('/Matcher', methods=['POST'])
+def matcher():
+    global model, model_type
+    try:
+        data = request.get_json()
+        if not data: return jsonify({'error': 'JSON required'}), 400
+
+        text_desc = (data.get('TextDescription') or data.get('query') or '').strip()
+        model_name = data.get('ModelName', '').lower()
+        model_path = data.get('UsedModel')
+        sources = data.get('UsedSources', [])
+        filter_cvss = data.get('FilteringCvss', False)
+
+        if not text_desc: return jsonify({'error': 'TextDescription required'}), 400
+        if model_name not in AVAILABLE_MODELS: return jsonify({'error': f'Invalid ModelName'}), 400
+        if model_name in (MODEL_WORD2VEC, MODEL_FASTTEXT):
+            if not model_path or not os.path.exists(model_path):
+                return jsonify({'error': 'Model file not found'}), 400
+        if not sources: return jsonify({'error': 'UsedSources required'}), 400
+
+        # 1. Загрузка всех файлов
+        source_to_items = {}
+        for src in sources:
+            path = os.path.join(SCRIPT_DIR, src.lstrip('/'))
+            if not os.path.exists(path):
+                print(f"[WARN] Not found: {path}")
+                source_to_items[src] = []
+                continue
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    js = json.load(f)
+                items = walk(js, src)
+                source_to_items[src] = items
+                print(f"[INFO] Loaded {len(items)} items from {src}")
+            except Exception as e:
+                print(f"[ERROR] {path}: {e}")
+                source_to_items[src] = []
+
+        # 2. Подготовка модели
+        if model_name in (MODEL_WORD2VEC, MODEL_FASTTEXT):
+            if model is None or model_type != model_name:
+                model = load_model(model_path, model_name)
+                if not model: return jsonify({'error': 'Model load failed'}), 500
+            q_vec = get_sentence_vector(text_desc, model, model_name)
+            q_norm = np.linalg.norm(q_vec) or 1
+        else:
+            q_vec = None
+
+        # 3. Обычный режим
+        if not filter_cvss:
+            db_top10 = {}
+            db_sim = {}
+            for src, items in source_to_items.items():
+                if not items:
+                    db_top10[src] = []
+                    db_sim[src] = []
+                    continue
+                sims = []
+                if model_name == MODEL_TFIDF:
+                    docs = [it['Description'] for it in items]
+                    if not docs:
+                        db_top10[src] = []
+                        db_sim[src] = []
+                        continue
+                    vec = TfidfVectorizer(token_pattern=r'\w+', ngram_range=(1,2))
+                    tf = vec.fit_transform(docs)
+                    qv = vec.transform([text_desc])
+                    scores = cosine_similarity(qv, tf).flatten()
+                    sims = [(s, it['GuidId']) for s, it in zip(scores, items) if s > 0]
+                else:
+                    for it in items:
+                        vec = get_sentence_vector(it['Description'], model, model_name)
+                        n = np.linalg.norm(vec) or 1
+                        s = np.dot(q_vec, vec) / (q_norm * n)
+                        if s > 0:
+                            sims.append((s, it['GuidId']))
+                sims.sort(key=lambda x: x[0], reverse=True)
+                db_top10[src] = [g for _, g in sims]
+                db_sim[src] = [s for s, _ in sims]
+
+            matcher_objects = []
+            max_rank = min(10, min(len(db_top10[src]) for src in sources if len(db_top10[src]) > 0))
+            for rank in range(1, max_rank + 1):
+                sources_dict = {}
+                sims = []
+                for src in sources:
+                    if rank <= len(db_top10[src]):
+                        guid = db_top10[src][rank - 1]
+                        sources_dict[guid] = src
+                        sims.append(db_sim[src][rank - 1])
+                if sims:
+                    avg_sim = sum(sims) / len(sims)
+                    matcher_objects.append({
+                        "Coefficient": round(avg_sim, 4),
+                        "Sources": sources_dict
+                    })
+            while len(matcher_objects) < 10:
+                matcher_objects.append({
+                    "Coefficient": 0.0,
+                    "Sources": {}
+                })
+            matcher_objects.sort(key=lambda x: x["Coefficient"], reverse=True)
+            return jsonify({"MatcherObjects": matcher_objects}), 200
+
+        # 4. CVSS режим
+        else:
+            # Собираем все threats и vulns
+            threats = [it for src, items in source_to_items.items() for it in items if it.get('IsThreat')]
+            vulns = [it for src, items in source_to_items.items() for it in items if it.get('IsVulnerability')]
+
+            if not threats or not vulns:
+                return jsonify({'error': 'No threats or vulnerabilities found'}), 400
+
+            pairs = []
+            for threat in threats:
+                p = threat['PrivacyViolation'] == '1'
+                i = threat['IntegrityViolation'] == '1'
+                a = threat['AccessibilityViolation'] == '1'
+                for vuln in vulns:
+                    cvss = vuln.get('CvssParsed', {})
+                    c_match = (cvss.get('C') == 'C') == p
+                    i_match = (cvss.get('I') == 'C') == i
+                    a_match = (cvss.get('A') == 'C') == a
+                    if c_match and i_match and a_match:
+                        if model_name == MODEL_TFIDF:
+                            docs = [text_desc, threat['Description'], vuln['Description']]
+                            vec = TfidfVectorizer(token_pattern=r'\w+', ngram_range=(1,2))
+                            tf = vec.fit_transform(docs)
+                            sim_qt = cosine_similarity(tf[0:1], tf[1:2])[0][0]
+                            sim_qv = cosine_similarity(tf[0:1], tf[2:3])[0][0]
+                            sim = sim_qt * 0.6 + sim_qv * 0.4
+                        else:
+                            t_vec = get_sentence_vector(threat['Description'], model, model_name)
+                            v_vec = get_sentence_vector(vuln['Description'], model, model_name)
+                            t_norm = np.linalg.norm(t_vec) or 1
+                            v_norm = np.linalg.norm(v_vec) or 1
+                            sim_qt = np.dot(q_vec, t_vec) / (q_norm * t_norm)
+                            sim_qv = np.dot(q_vec, v_vec) / (q_norm * v_norm)
+                            sim = sim_qt * 0.6 + sim_qv * 0.4
+                        pairs.append((sim, threat, vuln, sim_qt, sim_qv))
+
+            if not pairs:
+                return jsonify({'error': 'No matching CVSS pairs found'}), 400
+
+            pairs.sort(key=lambda x: x[0], reverse=True)
+
+            groups = []
+            for sim_par, threat, vuln, sim_qt, sim_qv in pairs[:20]:
+                t_src = threat['SourceFile']
+                v_src = vuln['SourceFile']
+                sources_dict = {threat['GuidId']: t_src, vuln['GuidId']: v_src}
+                sims = [sim_qt, sim_qv]
+                remaining_src = set(sources) - {t_src, v_src}
+                for r_src in remaining_src:
+                    items = source_to_items[r_src]
+                    if not items: continue
+                    if model_name == MODEL_TFIDF:
+                        docs = [it['Description'] for it in items]
+                        if not docs: continue
+                        vec = TfidfVectorizer(token_pattern=r'\w+', ngram_range=(1,2))
+                        tf = vec.fit_transform(docs)
+                        qv = vec.transform([text_desc])
+                        scores = cosine_similarity(qv, tf).flatten()
+                        if len(scores) == 0: continue
+                        best_idx = np.argmax(scores)
+                        best_sim = scores[best_idx]
+                        best_guid = items[best_idx]['GuidId']
+                    else:
+                        sims_r = []
+                        for it in items:
+                            vec = get_sentence_vector(it['Description'], model, model_name)
+                            n = np.linalg.norm(vec) or 1
+                            s = np.dot(q_vec, vec) / (q_norm * n)
+                            sims_r.append((s, it['GuidId']))
+                        if not sims_r: continue
+                        sims_r.sort(key=lambda x: x[0], reverse=True)
+                        best_sim, best_guid = sims_r[0]
+                    sources_dict[best_guid] = r_src
+                    sims.append(best_sim)
+                if sims:
+                    coeff = sum(sims) / len(sims)
+                else:
+                    coeff = 0.0
+                groups.append((coeff, sources_dict))
+
+            groups.sort(key=lambda x: x[0], reverse=True)
+            matcher_objects = [{
+                "Coefficient": round(coeff, 4),
+                "Sources": sources_dict
+            } for coeff, sources_dict in groups[:10]]
+
+            while len(matcher_objects) < 10:
+                matcher_objects.append({
+                    "Coefficient": 0.0,
+                    "Sources": {}
+                })
+
+            return jsonify({"MatcherObjects": matcher_objects}), 200
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "version": "v5.4 CVSS No DtoType",
+        "cvss_detection": "by fields: PrivacyViolation + CvssTwo",
+        "model": model_type
+    })
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=False, threaded=True)
