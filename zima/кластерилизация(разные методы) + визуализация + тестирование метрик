@@ -1,0 +1,254 @@
+import pandas as pn
+import spacy
+from tqdm import tqdm 
+import sentence_transformers
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+import seaborn as sns
+from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering
+import scipy.cluster.hierarchy as sch
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+import hdbscan
+df = pn.read_excel('yazvimosti.xlsx')
+df = df.drop_duplicates(subset=['Наименование'])
+df = df.dropna(axis=1, how="all")
+print(df.shape)
+classter_data = df["Наименование"]
+############################################################################блок предобработки текста и формирование эмбеддингов #######################################
+model = sentence_transformers.SentenceTransformer("all-MiniLM-L6-v2")
+#Загрузка модели spaCy для русского языка для лемматизации текста
+nlp = spacy.load("ru_core_news_sm")
+
+
+
+def prepare_data(text_list):
+   # Вложенная функция для очистки и лемматизации текста
+    def _lemmatization_rm_stop_words(text_list):
+        result_texts = []  # Список для хранения обработанных текстов
+        # Итерация по всем текстам с отображением прогресса
+        for text in tqdm(text_list):
+            text = text.lower()  # Приведение текста к нижнему регистру
+            # Обработка текста через spaCy с отключением ненужных компонентов для ускорения
+            doc = nlp(text, disable=["tok2vec", "tagger", "parser", "attribute_ruler"])
+            # Фильтрация токенов: оставляем только леммы не-стоп слов, пунктуации и не-букв
+            filtered_tokens = [token.lemma_ for token in doc if not (token.is_stop or token.is_punct or not token.is_alpha)]
+            filtered_text = " ".join(filtered_tokens)  # Объединение токенов обратно в текст
+            result_texts.append(filtered_text)  # Добавление обработанного текста в список
+        return result_texts	
+    
+    # Вложенная функция для векторизации текстов
+    def _vectorize_texts(text_list):
+        # Кодирование текстов в векторные представления (эмбеддинги)
+        embeddings = model.encode(text_list, normalize_embeddings=True, show_progress_bar=True)
+        return embeddings
+    print("Clearing texts...")
+    clear_text = _lemmatization_rm_stop_words(text_list)
+
+    print("Vectorize texts...")
+    embeddings = _vectorize_texts(clear_text)
+    return embeddings
+#####################################################################################################################################################
+
+#embedding_text = np.load("classter_yazvimosti.npy")
+embedding_text = prepare_data(classter_data.to_list())
+np.save("classter_yazvimosti_1.npy", embedding_text)
+# print(f"Размер эмбеддингов: {embedding_text.shape}")
+###################################################################блок визуализации эмбеддингов ################################################################
+
+
+# # 1. t-SNE для уменьшения размерности
+# print("Применение t-SNE...")
+# tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+# embeddings_2d = tsne.fit_transform(embedding_text)
+
+# # 2. Создание графика
+# plt.figure(figsize=(12, 8))
+# plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
+#             alpha=0.6, s=20, c='blue')
+# plt.title('t-SNE визуализация эмбеддингов', fontsize=16)
+# plt.xlabel('t-SNE компонента 1', fontsize=12)
+# plt.ylabel('t-SNE компонента 2', fontsize=12)
+# plt.grid(True, alpha=0.3)
+# plt.tight_layout()
+# plt.show()
+####################################################################################################################################################
+############################################################блок формирования кластеров на основе KMeans (метод локтя) #####################################################################
+# inertias = []
+# K_range = range(2, 15)
+
+# for k in K_range:
+#     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+#     kmeans.fit(embedding_text)
+#     inertias.append(kmeans.inertia_)
+
+# # График метода локтя
+# plt.figure(figsize=(10, 5))
+# plt.plot(K_range, inertias, 'bo-')
+# plt.xlabel('Число кластеров')
+# plt.ylabel('Inertia')
+# plt.title('Метод локтя для K-Means')
+# plt.grid(True, alpha=0.3)
+# plt.show()
+
+# # Выбираем оптимальное k (например, где "локоть" на графике)
+# optimal_k = 5  # Подберите по графику
+
+# # Кластеризация K-Means
+# kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+# cluster_labels = kmeans.fit_predict(embedding_text)
+
+# print(f"Кластеризация K-Means (k={optimal_k})")
+# print(f"Распределение по кластерам: {np.bincount(cluster_labels)}")
+##########################################################################################################################
+
+
+
+#############################################визуализация кластеров через картинку ########################################################
+# kmeans = KMeans(n_clusters=5, random_state=42)
+# clusters = kmeans.fit_predict(embedding_text)
+
+# # Уменьшение размерности для визуализации
+# tsne = TSNE(n_components=2, random_state=42)
+# points_2d = tsne.fit_transform(embedding_text)
+
+# # Картинка
+# plt.figure(figsize=(12, 9))
+# plt.scatter(points_2d[:, 0], points_2d[:, 1], 
+#             c=clusters, cmap='viridis', alpha=0.7, s=40)
+
+# plt.title(f'Кластеры текстов ({len(embedding_text)} записей)')
+# plt.axis('off')  # Убираем оси для чистой картинки
+
+# # Сохраняем
+# plt.savefig('text_clusters.png', dpi=150, bbox_inches='tight', transparent=True)
+# plt.show()
+############################################################################################################################################################
+############################################################визуализация с помощью наведения по курсору ####################################################
+# descriptions = df['Наименование'].fillna("").tolist()
+
+# print(f"Загружено {len(embedding_text)} эмбеддингов и {len(descriptions)} описаний")
+###########################################################метод кластерилизации Hierarchical ###################################################
+# agg = AgglomerativeClustering(
+#     n_clusters=10,          # Число кластеров
+#     linkage='ward',         # Метод связи: 'ward', 'complete', 'average', 'single'
+#     metric='euclidean'      # Метрика расстояния
+# )
+# agg_clusters = agg.fit_predict(embedding_text)
+####################################################################################################################################################
+###################################################################метод HDBSCAN для кластерилизации #########################################################
+# hdb = hdbscan.HDBSCAN(
+#         min_cluster_size=5,      # Минимальный размер кластера
+#         min_samples=None,        # Минимум точек в ядре
+#         cluster_selection_epsilon=0.0,
+#         metric='euclidean',
+#         cluster_selection_method='eom'  # 'eom' или 'leaf'
+#     )
+# hdb_clusters = hdb.fit_predict(embedding_text)
+########################################################################################################################################################
+# Кластеризация
+# kmeans = KMeans(n_clusters=10, random_state=42)
+# clusters = kmeans.fit_predict(embedding_text)
+
+# #Уменьшение размерности
+# tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+# points_2d = tsne.fit_transform(embedding_text)
+
+# # Создаем фигуру
+# fig, ax = plt.subplots(figsize=(14, 10))
+# scatter = ax.scatter(points_2d[:, 0], points_2d[:, 1], 
+#                      c=clusters, cmap='viridis', alpha=0.7, s=40, picker=True)
+
+# ax.set_title(f'Кластеры текстов ({len(embedding_text)} записей)\nНаведите курсор на точку', fontsize=14)
+# ax.axis('off')
+
+# # Создаем аннотацию (изначально невидимую)
+# annot = ax.annotate("", xy=(0,0), xytext=(20,20), 
+#                     textcoords="offset points",
+#                     bbox=dict(boxstyle="round", fc="w", alpha=0.9),
+#                     arrowprops=dict(arrowstyle="->"))
+# annot.set_visible(False)
+
+# # Функция для обновления аннотации при наведении
+# def update_annot(ind):
+#     pos = scatter.get_offsets()[ind["ind"][0]]
+#     annot.xy = pos
+    
+#     # Собираем текст для нескольких точек (если выбрано несколько)
+#     text = ""
+#     for i in range(min(3, len(ind["ind"]))):  # Показываем максимум 3 точки
+#         idx = ind["ind"][i]
+#         desc = descriptions[idx] if idx < len(descriptions) else f"Точка {idx}"
+#         text += f"Точка {idx} (кластер {clusters[idx]}):\n"
+#         text += f"{desc[:150]}...\n\n" if len(desc) > 150 else f"{desc}\n\n"
+    
+#     annot.set_text(text)
+#     annot.get_bbox_patch().set_alpha(0.9)
+
+# # Функция обработки события наведения
+# def hover(event):
+#     vis = annot.get_visible()
+#     if event.inaxes == ax:
+#         cont, ind = scatter.contains(event)
+#         if cont:
+#             update_annot(ind)
+#             annot.set_visible(True)
+#             fig.canvas.draw_idle()
+#         else:
+#             if vis:
+#                 annot.set_visible(False)
+#                 fig.canvas.draw_idle()
+
+# # Подключаем обработчик событий
+# fig.canvas.mpl_connect("motion_notify_event", hover)
+
+# plt.tight_layout()
+# plt.savefig('text_clusters_interactive.png', dpi=150, bbox_inches='tight')
+# print("Готово! Наведите курсор на любую точку")
+# plt.show()
+# ####################################################################################################################################################
+# # kmeans = KMeans(n_clusters=6, random_state=42)
+# # clusters = kmeans.fit_predict(embedding_text)
+# print("="*60)
+# print("ОЦЕНКА КАЧЕСТВА КЛАСТЕРИЗАЦИИ (внутренние метрики)")
+# print("="*60)
+
+# # 1. Silhouette Score (-1 до 1, чем больше тем лучше)
+# sil_score = silhouette_score(embedding_text, clusters)
+# print(f"\n1. Silhouette Score: {sil_score:.4f}")
+# print("   • > 0.7: Отличная кластеризация")
+# print("   • 0.5-0.7: Хорошая")
+# print("   • 0.25-0.5: Умеренная")
+# print("   • < 0.25: Слабая")
+
+# # 2. Calinski-Harabasz Score (чем больше тем лучше)
+# ch_score = calinski_harabasz_score(embedding_text, clusters)
+# print(f"\n2. Calinski-Harabasz Score: {ch_score:.2f}")
+# print("   • Чем выше, тем лучше разделены кластеры")
+
+# # 3. Davies-Bouldin Score (чем меньше тем лучше)
+# db_score = davies_bouldin_score(embedding_text, clusters)
+# print(f"\n3. Davies-Bouldin Score: {db_score:.4f}")
+# print("   • 0: Идеальная кластеризация")
+# print("   • < 0.5: Отличная")
+# print("   • 0.5-1.0: Хорошая")
+# print("   • > 1.0: Слабая")
+
+# # Оценка по всем метрикам
+# print("\n" + "="*60)
+# print("ИТОГОВАЯ ОЦЕНКА:")
+# print("="*60)
+
+# if sil_score > 0.5 and db_score < 1.0:
+#     print("✅ Кластеризация УСПЕШНА")
+#     if sil_score > 0.7:
+#         print("   Качество: ОТЛИЧНОЕ")
+#     elif sil_score > 0.5:
+#         print("   Качество: ХОРОШЕЕ")
+# else:
+#     print("⚠️ Кластеризация ТРЕБУЕТ ДОРАБОТКИ")
+#     print("   Рекомендации:")
+#     print("   - Попробуйте другое число кластеров")
+#     print("   - Используйте другой алгоритм кластеризации")
+#     print("   - Проверьте данные на выбросы")
