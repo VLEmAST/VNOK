@@ -1,0 +1,34 @@
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.linear_model import LogisticRegression
+from gensim.models import FastText
+# Загрузка и обучение (как в моём вызове)
+df = pd.read_csv('ygrozi.csv', sep=';', encoding='utf-8')
+df.columns = df.columns.str.strip()
+descriptions = df['Описание'].astype(str).values
+y = np.column_stack((df['Нарушение конфиденциальности'].astype(int),
+                     df['Нарушение целостности'].astype(int),
+                     df['Нарушение доступности'].astype(int)))
+
+vectorizer = FastText.load_fasttext_format(r'C:\Users\admin\Desktop\proga\win-x64\Models\fastText_from_facebook.bin')
+
+def vector_of_sentence_fasttext(senten, mod):
+    resul = []
+    for sen in senten:
+        words = sen.lower().split()
+        vectors = [mod.wv[word] for word in words if word in mod.wv]
+        resul.append(np.mean(vectors, axis=0))
+    return np.array(resul)
+
+X = vector_of_sentence_fasttext(descriptions, vectorizer)
+
+model = MultiOutputClassifier(LogisticRegression(max_iter=1000))
+model.fit(X, y)
+
+# Предсказание для нового описания
+new_desc = ["Угроза заключается в возможности раскрытия нарушителем защищаемых сведений о состоянии защищённости дискредитируемой системы, её конфигурации и потенциальных уязвимостях и др., путём проведения мероприятий по сбору и анализу доступной информации о системе.Данная угроза обусловлена наличием уязвимостей в сетевом программном обеспечении, позволяющим получить сведения о конфигурации отдельных программ или системы в целом (отсутствие контроля входных данных, наличие открытых сетевых портов, неправильная настройка политик безопасности и т.п.).Реализация данной угрозы возможна при условии получения информации о дискредитируемой системе с помощью хотя бы одного из следующих способов изучения дискредитируемой системы:анализ реакций системы на сетевые (в т.ч. синтаксически неверные или нестандартные) запросы к открытым в системе сетевым сервисам, которые могут стать причиной вызова необработанных исключений с подробными сообщениями об ошибках, содержащих защищаемую информацию (о трассировке стека, о конфигурации системы, о маршруте прохождения сетевых пакетов)анализ реакций системы на строковые URI-запросы (в т.ч. неверные SQL-запросы, альтернативные пути доступа к файлам).Данная угроза отличается от угрозы перехвата данных и других угроз сбора данных тем, что нарушитель активно опрашивает дискредитируемую систему, а не просто за ней наблюдает"]  # Пример: список строк
+X_new = vector_of_sentence_fasttext(new_desc, vectorizer)
+pred = model.predict(X_new)
+print(pred)  # Вывод: [[conf int avail]], напр. [[1 0 1]] — класс 5
