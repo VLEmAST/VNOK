@@ -1,0 +1,188 @@
+import pandas as pd
+from sklearn.cluster import KMeans
+#import spacy
+#import sentence_transformers
+#from tqdm import tqdm 
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+import fasttext
+import mplcursors
+import numpy as np
+from gensim.models import FastText, KeyedVectors
+import io
+df = pd.read_csv("ygrozi.csv", sep=";", encoding="utf-8")
+df = df.dropna(axis=1, how="all")
+classter_data = df["Описание"]
+# model = sentence_transformers.SentenceTransformer("all-MiniLM-L6-v2")
+# nlp = spacy.load("ru_core_news_sm")
+
+
+
+# def prepare_data(text_list):
+#    # Вложенная функция для очистки и лемматизации текста
+#     def _lemmatization_rm_stop_words(text_list):
+#         result_texts = []  # Список для хранения обработанных текстов
+#         # Итерация по всем текстам с отображением прогресса
+#         for text in tqdm(text_list):
+#             text = text.lower()  # Приведение текста к нижнему регистру
+#             # Обработка текста через spaCy с отключением ненужных компонентов для ускорения
+#             doc = nlp(text, disable=["tok2vec", "tagger", "parser", "attribute_ruler"])
+#             # Фильтрация токенов: оставляем только леммы не-стоп слов, пунктуации и не-букв
+#             filtered_tokens = [token.lemma_ for token in doc if not (token.is_stop or token.is_punct)]
+#             filtered_text = " ".join(filtered_tokens)  # Объединение токенов обратно в текст
+#             result_texts.append(filtered_text)  # Добавление обработанного текста в список
+#         return result_texts	
+    
+#     # Вложенная функция для векторизации текстов
+#     def _vectorize_texts(text_list):
+#         # Кодирование текстов в векторные представления (эмбеддинги)
+#         embeddings = model.encode(text_list, normalize_embeddings=True, show_progress_bar=True)
+#         return embeddings
+#     print("Clearing texts...")
+#     clear_text = _lemmatization_rm_stop_words(text_list)
+
+#     print("Vectorize texts...")
+#     embeddings = _vectorize_texts(clear_text)
+#     return embeddings
+# embedding_text = prepare_data(classter_data.to_list())
+# print(embedding_text)
+
+
+
+#########################################FASTTEXT ###########################################
+###############обучение Fasttext ##########################################
+# Model = FastText(sentences=classter_data,
+#                  vector_size=300,
+#                  sg=1,
+#                  window=5,
+#                  epochs=10)
+############################################################################
+Model = FastText.load_fasttext_format(r'C:\Users\admin\Desktop\proga\win-x64\Models\fastText_from_facebook.bin')
+# Model = fasttext.train_unsupervised(
+#     input = classter_data,
+#     model ='skipgram',
+#     ws = 5,
+#     epoch= 10
+# )
+def vector_of_sentence_fasttext(senten, mod):
+    resul = []
+    for sen in senten:
+        words = sen.lower().split()
+        vectors = [mod.wv[word] for word in words if word in mod.wv]
+        resul.append(np.mean(vectors, axis=0))
+    return np.array(resul)
+
+vec = vector_of_sentence_fasttext(classter_data, Model)
+
+
+
+
+kmeans = KMeans(n_clusters=10, random_state=42)
+clusters = kmeans.fit_predict(vec)
+descriptions = df['Наименование'].fillna("").tolist()
+
+#Уменьшение размерности
+tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+points_2d = tsne.fit_transform(vec)
+
+# Создаем фигуру
+fig, ax = plt.subplots(figsize=(14, 10))
+scatter = ax.scatter(points_2d[:, 0], points_2d[:, 1], 
+                     c=clusters, cmap='viridis', alpha=0.7, s=40, picker=True)
+
+ax.set_title(f'Кластеры текстов ({len(vec)} записей)\nНаведите курсор на точку', fontsize=14)
+ax.axis('off')
+
+# Создаем аннотацию (изначально невидимую)
+annot = ax.annotate("", xy=(0,0), xytext=(20,20), 
+                    textcoords="offset points",
+                    bbox=dict(boxstyle="round", fc="w", alpha=0.9),
+                    arrowprops=dict(arrowstyle="->"))
+annot.set_visible(False)
+
+# Функция для обновления аннотации при наведении
+def update_annot(ind):
+    pos = scatter.get_offsets()[ind["ind"][0]]
+    annot.xy = pos
+    
+    # Собираем текст для нескольких точек (если выбрано несколько)
+    text = ""
+    for i in range(min(3, len(ind["ind"]))):  # Показываем максимум 3 точки
+        idx = ind["ind"][i]
+        desc = descriptions[idx] if idx < len(descriptions) else f"Точка {idx}"
+        text += f"Точка {idx} (кластер {clusters[idx]}):\n"
+        text += f"{desc[:150]}...\n\n" if len(desc) > 150 else f"{desc}\n\n"
+    
+    annot.set_text(text)
+    annot.get_bbox_patch().set_alpha(0.9)
+
+# Функция обработки события наведения
+def hover(event):
+    vis = annot.get_visible()
+    if event.inaxes == ax:
+        cont, ind = scatter.contains(event)
+        if cont:
+            update_annot(ind)
+            annot.set_visible(True)
+            fig.canvas.draw_idle()
+        else:
+            if vis:
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+
+# Подключаем обработчик событий
+fig.canvas.mpl_connect("motion_notify_event", hover)
+
+plt.tight_layout()
+plt.savefig('text_clusters_interactive.png', dpi=150, bbox_inches='tight')
+print("Готово! Наведите курсор на любую точку")
+plt.show()
+################################################################################################
+# print("Применение t-SNE...")
+# tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000, init='pca')
+# embeddings_2d = tsne.fit_transform(vec)
+
+# # Предполагаем, что у вас есть список текстов
+# # texts_list = [текст1, текст2, ...]  # Ваши исходные тексты
+
+# # 2. Создание графика
+# fig, ax = plt.subplots(figsize=(14, 10))
+
+# # Преобразуем в обычный массив numpy
+# embeddings_2d = np.asarray(embeddings_2d)
+
+# scatter = ax.scatter(
+#     embeddings_2d[:, 0], 
+#     embeddings_2d[:, 1], 
+#     alpha=0.6, 
+#     s=20, 
+#     c='blue'
+# )
+
+# # Добавляем интерактивность с mplcursors
+# cursor = mplcursors.cursor(scatter, hover=True)
+
+# # Функция для форматирования подсказки
+# @cursor.connect("add")
+# def on_add(sel):
+#     # Получаем индекс точки через sel.index
+#     idx = sel.index
+#     # Обрезаем текст для отображения (первые 100 символов)
+#     if idx < len(classter_data):
+#         short_text = classter_data[idx][:100] + "..." if len(classter_data[idx]) > 100 else classter_data[idx]
+#         sel.annotation.set_text(f"Индекс: {idx}\n{short_text}")
+#     else:
+#         sel.annotation.set_text(f"Индекс: {idx}\nТекст не найден")
+    
+#     sel.annotation.set_fontsize(10)
+#     # Устанавливаем максимальную ширину аннотации
+#     sel.annotation.get_bbox_patch().set_boxstyle("round", pad=0.3)
+#     # Автоматически подгоняем размер
+#     sel.annotation.set_wrap(True)
+
+# plt.title('t-SNE визуализация эмбеддингов (наведите курсор на точку)', fontsize=16)
+# plt.xlabel('t-SNE компонента 1', fontsize=12)
+# plt.ylabel('t-SNE компонента 2', fontsize=12)
+# plt.grid(True, alpha=0.3)
+# plt.tight_layout()
+# plt.show()
