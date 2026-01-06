@@ -1,0 +1,388 @@
+import pandas as pd
+import numpy as np
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+import warnings
+warnings.filterwarnings('ignore')
+
+# 1. Загрузка данных
+df = pd.read_csv('yazvimosti.csv', sep=',', encoding='utf-8')
+print(f"Всего записей: {len(df)}")
+
+# 2. Функция для создания 7 классов из CVSS
+def create_7_classes_from_cvss(cvss_str):
+    """Создает 7 классов из CVSS вектора"""
+    if pd.isna(cvss_str):
+        return 0  # Нет нарушений
+    
+    cvss_str = str(cvss_str)
+    
+    # Извлекаем значения C, I, A
+    c_match = re.search(r'C:([NPC])', cvss_str)
+    i_match = re.search(r'I:([NPC])', cvss_str)
+    a_match = re.search(r'A:([NPC])', cvss_str)
+    
+    c_value = c_match.group(1) if c_match else 'N'
+    i_value = i_match.group(1) if i_match else 'N'
+    a_value = a_match.group(1) if a_match else 'N'
+    
+    # Преобразуем в бинарные
+    c = 1 if c_value != 'N' else 0
+    i = 1 if i_value != 'N' else 0
+    a = 1 if a_value != 'N' else 0
+    
+    # Создаем числовой класс по схеме C-I-A (бинарное представление)
+    class_number = c * 4 + i * 2 + a
+    
+    return class_number
+
+# 3. Создаем целевые переменные (7 классов)
+print("Создание 7 классов из CVSS...")
+y = np.array([create_7_classes_from_cvss(cvss) for cvss in df['CVSS 2.0']])
+
+# 4. Анализ распределения классов
+print("\nРаспределение классов:")
+class_counts = Counter(y)
+class_names = {
+    0: "000: Нет нарушений",
+    1: "001: Только доступность (A)",
+    2: "010: Только целостность (I)", 
+    3: "011: Целостность + доступность (I+A)",
+    4: "100: Только конфиденциальность (C)",
+    5: "101: Конфиденциальность + доступность (C+A)",
+    6: "110: Конфиденциальность + целостность (C+I)",
+    7: "111: Все три (C+I+A)"
+}
+
+for class_num in range(8):
+    count = class_counts.get(class_num, 0)
+    print(f"  Класс {class_num}: {class_names[class_num]} - {count} записей ({count/len(y):.1%})")
+
+# 5. Проверяем классы с малым количеством образцов
+print("\nПроверка классов с малым количеством образцов:")
+problematic_classes = []
+for class_num, count in class_counts.items():
+    if count < 5:  # Классы с менее чем 5 образцами
+        problematic_classes.append((class_num, count))
+        print(f"  ВНИМАНИЕ: Класс {class_num} имеет всего {count} образец(а)")
+
+# 6. Текстовые данные
+print("\nПодготовка текстовых данных...")
+descriptions = df['Описание'].fillna('').astype(str).values
+
+# 7. Векторизация текста
+print("Векторизация текстов...")
+vectorizer = TfidfVectorizer(
+    max_features=1000,  # Уменьшим для небольшого датасета
+    ngram_range=(1, 2),
+    min_df=2,
+    max_df=0.9
+)
+
+X = vectorizer.fit_transform(descriptions)
+print(f"Размерность признаков: {X.shape}")
+
+# 8. СБОРКА ДАННЫХ - несколько вариантов в зависимости от ситуации
+
+# Вариант A: Если есть классы с 1 образцом - удаляем их или объединяем
+print("\n" + "="*60)
+print("РЕШЕНИЕ ПРОБЛЕМЫ С МАЛЫМИ КЛАССАМИ")
+print("="*60)
+
+if problematic_classes:
+    print("Найдены классы с малым количеством образцов. Используем один из вариантов:")
+    print("1. Удаляем образцы из редких классов")
+    print("2. Объединяем редкие классы")
+    print("3. Используем разделение без стратификации")
+    
+    # Вариант 1: Удаляем классы с менее чем 2 образцами
+    min_samples = 2
+    valid_indices = [i for i, label in enumerate(y) if class_counts[label] >= min_samples]
+    
+    if len(valid_indices) > len(y) * 0.5:  # Если осталось больше 50% данных
+        X_filtered = X[valid_indices]
+        y_filtered = y[valid_indices]
+        descriptions_filtered = descriptions[valid_indices]
+        
+        print(f"\nВариант 1: Удаляем классы с <{min_samples} образцами")
+        print(f"  Было: {len(y)} записей")
+        print(f"  Стало: {len(y_filtered)} записей")
+        print(f"  Удалено: {len(y) - len(y_filtered)} записей")
+        
+        X = X_filtered
+        y = y_filtered
+        descriptions = descriptions_filtered
+        
+        # Обновляем распределение
+        class_counts = Counter(y)
+    else:
+        print("\nВариант 1 не подходит - удалено слишком много данных")
+        print("Используем Вариант 3: разделение без стратификации")
+
+# 9. РАЗДЕЛЕНИЕ ДАННЫХ - с обработкой малых классов
+print("\nРазделение данных...")
+
+try:
+    # Пробуем со стратификацией
+    X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
+        X, y, np.arange(len(y)), test_size=0.2, random_state=42, stratify=y
+    )
+    print("Разделение выполнено СО стратификацией")
+    
+except ValueError as e:
+    print(f"Ошибка при стратифицированном разделении: {e}")
+    print("Выполняем разделение БЕЗ стратификации")
+    
+    # Разделение без стратификации
+    X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
+        X, y, np.arange(len(y)), test_size=0.2, random_state=42
+    )
+
+print(f"Обучающая выборка: {X_train.shape[0]} записей")
+print(f"Тестовая выборка: {X_test.shape[0]} записей")
+
+# Получаем описания для тренировочной и тестовой выборок
+descriptions_train = descriptions[idx_train]
+descriptions_test = descriptions[idx_test]
+
+# 10. Проверяем наличие всех классов в обучающей выборке
+print("\nРаспределение классов в обучающей выборке:")
+train_class_counts = Counter(y_train)
+for class_num in range(8):
+    count = train_class_counts.get(class_num, 0)
+    if count > 0:
+        print(f"  Класс {class_num}: {count} записей")
+
+# 11. ОБУЧЕНИЕ МОДЕЛИ с учетом несбалансированности
+print("\nОбучение модели для 7 классов...")
+
+# Настраиваем параметры для несбалансированных данных
+model = RandomForestClassifier(
+    n_estimators=150,  # Увеличиваем количество деревьев
+    random_state=42,
+    class_weight='balanced_subsample',  # Лучше для RandomForest
+    max_depth=10,  # Ограничиваем глубину
+    min_samples_split=5,  # Минимум образцов для разделения
+    min_samples_leaf=2,   # Минимум образцов в листе
+    max_features='sqrt',  # Квадратный корень от количества признаков
+    n_jobs=-1
+)
+
+model.fit(X_train, y_train)
+
+# 12. ОЦЕНКА МОДЕЛИ
+print("\n" + "="*60)
+print("ОЦЕНКА МОДЕЛИ ДЛЯ 7 КЛАССОВ")
+print("="*60)
+
+y_pred = model.predict(X_test)
+
+# Общая точность
+accuracy = accuracy_score(y_test, y_pred)
+print(f"Общая точность: {accuracy:.4f}")
+
+# Подробный отчет (только для классов, которые есть в тестовой выборке)
+test_classes = np.unique(y_test)
+target_names = [class_names[i] for i in test_classes if i in class_names]
+
+print("\nПодробный отчет по классам (только присутствующие в тесте):")
+print(classification_report(y_test, y_pred, 
+                          target_names=target_names,
+                          zero_division=0))
+
+# 13. АЛЬТЕРНАТИВНЫЙ ПОДХОД: Если данных очень мало
+print("\n" + "="*60)
+print("АЛЬТЕРНАТИВНЫЙ ПОДХОД ДЛЯ МАЛОГО НАБОРА ДАННЫХ")
+print("="*60)
+
+# Если у вас очень мало данных, можно использовать:
+# 1. Стратифицированную кросс-валидацию с группами
+# 2. Обучение на всех данных с последующей ручной проверкой
+# 3. Упрощение задачи (меньше классов)
+
+# Вариант: Объединяем редкие классы
+def simplify_classes(y_original, min_samples=3):
+    """Объединяет редкие классы в соседние"""
+    y_simplified = y_original.copy()
+    class_counts = Counter(y_original)
+    
+    # Маппинг для объединения (например, класс 5 -> 4, если 5 редкий)
+    merge_map = {
+        5: 4,  # C+A -> C
+        3: 2,  # I+A -> I
+        6: 4,  # C+I -> C
+        1: 7,  # A -> C+I+A (или 0)
+    }
+    
+    for old_class, new_class in merge_map.items():
+        if class_counts.get(old_class, 0) < min_samples:
+            y_simplified[y_simplified == old_class] = new_class
+    
+    return y_simplified
+
+# Проверяем, нужно ли упрощать
+print("\nПроверка необходимости упрощения классов:")
+y_simplified = simplify_classes(y, min_samples=3)
+simplified_counts = Counter(y_simplified)
+
+print("После возможного упрощения:")
+for class_num in range(8):
+    original = class_counts.get(class_num, 0)
+    simplified = simplified_counts.get(class_num, 0)
+    if original > 0:
+        change = simplified - original
+        if change != 0:
+            print(f"  Класс {class_num}: {original} → {simplified} ({'+' if change > 0 else ''}{change})")
+
+# 14. ФУНКЦИЯ ДЛЯ ПРЕДСКАЗАНИЯ (универсальная)
+def predict_vulnerability_class(description_text, model, vectorizer, class_names):
+    """Предсказывает класс уязвимости"""
+    # Векторизация
+    text_vectorized = vectorizer.transform([description_text])
+    
+    # Предсказание
+    class_num = model.predict(text_vectorized)[0]
+    
+    # Вероятности (если доступны)
+    if hasattr(model, 'predict_proba'):
+        probabilities = model.predict_proba(text_vectorized)[0]
+        probs_dict = {}
+        for i, prob in enumerate(probabilities):
+            if i in class_names:
+                probs_dict[class_names[i]] = float(prob)
+    else:
+        probs_dict = None
+    
+    # Расшифровка
+    prediction = {
+        'class_number': int(class_num),
+        'class_name': class_names.get(class_num, f"Неизвестный класс {class_num}"),
+        'components': {
+            'confidentiality': bool(class_num & 4),
+            'integrity': bool(class_num & 2),
+            'availability': bool(class_num & 1)
+        },
+        'probabilities': probs_dict,
+        'confidence': float(max(probabilities)) if probs_dict else None
+    }
+    
+    return prediction
+
+# 15. ТЕСТИРОВАНИЕ МОДЕЛИ
+print("\n" + "="*60)
+print("ТЕСТИРОВАНИЕ МОДЕЛИ НА ПРИМЕРАХ")
+print("="*60)
+
+test_examples = [
+    "УЭксплуатация уязвимости операционной системы межсетевого экрана/маршрутизатора Zyxel ZyWALL USG 300 позволяет удаленному злоумышленнику загружать и скачивать файлы с конфигурацией устройства без дополнительной аутентификации, в результате чего злоумышленник может просмотреть или изменить пароль администратора",
+    "Возможность вызвать отказ в обслуживании системы",
+    "Уязвимость позволяет изменять данные в базе данных",
+    "Возможность и просмотра и изменения конфигурационных файлов",
+    "Утечка данных и сбой системы"
+]
+
+for i, example in enumerate(test_examples):
+    try:
+        prediction = predict_vulnerability_class(example, model, vectorizer, class_names)
+        
+        print(f"\nПример {i+1}:")
+        print(f"  Описание: {example[:80]}...")
+        print(f"  Предсказанный класс: {prediction['class_number']} - {prediction['class_name']}")
+        print(f"  Компоненты: C={prediction['components']['confidentiality']}, "
+              f"I={prediction['components']['integrity']}, "
+              f"A={prediction['components']['availability']}")
+        
+        if prediction['probabilities']:
+            # Топ-3 вероятных класса
+            sorted_probs = sorted(prediction['probabilities'].items(), 
+                                key=lambda x: x[1], reverse=True)[:3]
+            print(f"  Топ-3 вероятных класса:")
+            for class_name, prob in sorted_probs:
+                if prob > 0.01:  # Показываем только значимые
+                    print(f"    • {class_name}: {prob:.1%}")
+    
+    except Exception as e:
+        print(f"\nОшибка при предсказании для примера {i+1}: {e}")
+
+# 16. СОХРАНЕНИЕ МОДЕЛИ
+print("\n" + "="*60)
+print("СОХРАНЕНИЕ МОДЕЛИ")
+print("="*60)
+
+import joblib
+
+model_data = {
+    'model': model,
+    'vectorizer': vectorizer,
+    'class_names': class_names,
+    'metadata': {
+        'accuracy': float(accuracy),
+        'n_samples': len(y),
+        'n_classes': len(np.unique(y)),
+        'class_distribution': dict(Counter(y)),
+        'feature_count': X.shape[1],
+        'training_date': pd.Timestamp.now().isoformat()
+    }
+}
+
+joblib.dump(model_data, 'vulnerability_classifier.joblib', compress=3)
+print(f"Модель сохранена в 'vulnerability_classifier.joblib'")
+print(f"Всего классов: {len(np.unique(y))}")
+print(f"Распределение: {dict(Counter(y))}")
+
+# 17. ДОПОЛНИТЕЛЬНЫЙ ВАРИАНТ: Использование всех данных для обучения
+print("\n" + "="*60)
+print("ВАРИАНТ: ОБУЧЕНИЕ НА ВСЕХ ДАННЫХ")
+print("="*60)
+
+print("Если данных мало, можно обучить на всех данных и проверять на новых примерах:")
+
+# Обучаем на всех данных
+model_full = RandomForestClassifier(
+    n_estimators=100,
+    random_state=42,
+    class_weight='balanced',
+    max_depth=8
+)
+
+model_full.fit(X, y)
+print(f"Модель обучена на всех {len(y)} записях")
+
+# Сохраняем полную модель
+full_model_data = {
+    'model': model_full,
+    'vectorizer': vectorizer,
+    'class_names': class_names
+}
+
+joblib.dump(full_model_data, 'vulnerability_classifier_full.joblib')
+print("Полная модель сохранена в 'vulnerability_classifier_full.joblib'")
+
+# 18. РЕКОМЕНДАЦИИ
+print("\n" + "="*60)
+print("РЕКОМЕНДАЦИИ")
+print("="*60)
+
+print("Проблема: слишком мало данных для некоторых классов")
+print("\nВарианты решения:")
+print("1. Собрать больше данных об уязвимостях")
+print("2. Использовать transfer learning (предобученные модели)")
+print("3. Упростить задачу до 3-4 классов вместо 8")
+print("4. Использовать техники oversampling (SMOTE)")
+print("5. Применить few-shot learning подходы")
+
+print("\nДля вашего случая рекомендую:")
+if len(y) < 100:
+    print("  - Упростить до 4 основных классов: C, I, A, C+I+A")
+    print("  - Использовать обучение на всех данных")
+    print("  - Рассмотреть использование BERT/RoBERTa для русского языка")
+else:
+    print("  - Удалить классы с <3 образцами")
+    print("  - Использовать взвешенные классы")
+    print("  - Применить кросс-валидацию")
